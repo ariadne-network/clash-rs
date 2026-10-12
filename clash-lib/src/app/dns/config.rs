@@ -16,14 +16,30 @@ use tracing::warn;
 use url::Url;
 pub use watfaq_dns::{DNSListenAddr, DoH3Config, DoHConfig, DoTConfig};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NameServer {
     pub net: DNSNetMode,
     pub host: url::Host<String>,
     pub port: u16,
     pub interface: Option<OutboundInterface>,
     pub proxy: Option<String>,
+    /// DoH: the URL's path and query when it has its own ("/dns-query"
+    /// otherwise). Not shown: providers put account tokens there.
+    pub path: Option<String>,
 }
+impl std::fmt::Debug for NameServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NameServer")
+            .field("net", &self.net)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("interface", &self.interface)
+            .field("proxy", &self.proxy)
+            .field("path", &self.path.as_ref().map(|_| "<set>"))
+            .finish()
+    }
+}
+
 impl Display for NameServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -122,6 +138,7 @@ impl Config {
             let proxy = Self::parse_outbound_proxy(&url);
             let net: &str;
             let port: u16;
+            let mut path = None;
 
             match url.scheme() {
                 "udp" => {
@@ -139,6 +156,12 @@ impl Config {
                 "https" => {
                     port = url.port().unwrap_or(443);
                     net = "DoH";
+                    if url.path() != "/" || url.query().is_some() {
+                        path = Some(match url.query() {
+                            Some(query) => format!("{}?{query}", url.path()),
+                            None => url.path().to_owned(),
+                        });
+                    }
                 }
                 "dhcp" => {
                     port = url.port().unwrap_or(0);
@@ -175,6 +198,7 @@ impl Config {
                     })
                     .transpose()?,
                 proxy,
+                path,
             });
         }
 
@@ -517,6 +541,22 @@ mod tests {
         let _sock: std::net::SocketAddr = format!("{}:{}", ns[0].host, ns[0].port)
             .parse()
             .expect("address should parse to SocketAddr");
+    }
+
+    #[test]
+    fn parse_nameserver_doh_path() {
+        let servers = vec![
+            "https://dns.example/dns-query".to_string(),
+            "https://dns.example/".to_string(),
+            "https://dns.example/token/dns-query?a=1".to_string(),
+        ];
+        let ns = Config::parse_nameserver(&servers).expect("parse failed");
+        assert_eq!(ns[0].path.as_deref(), Some("/dns-query"));
+        assert_eq!(ns[1].path, None);
+        assert_eq!(ns[2].path.as_deref(), Some("/token/dns-query?a=1"));
+        assert_eq!(ns[2].net, DNSNetMode::DoH);
+        // Tokens stay out of logs.
+        assert!(!format!("{} {:?}", ns[2], ns[2]).contains("token"));
     }
 
     #[test]

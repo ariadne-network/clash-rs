@@ -200,6 +200,8 @@ pub struct Opts {
     /// is true; bootstrap clients (`default-nameserver`,
     /// `proxy-server-nameserver`) leave this `None`.
     pub rule_dispatch: Option<Arc<RuleDispatch>>,
+    /// DoH: the URL path ("/dns-query" when None).
+    pub path: Option<String>,
 }
 
 type FwMark = Option<u32>;
@@ -230,6 +232,8 @@ enum DnsConfig {
         Option<OutboundInterface>,
         Arc<dyn OutboundHandler>,
         FwMark,
+        // The URL path; not shown, it may hold a token.
+        Arc<str>,
     ),
 }
 
@@ -260,7 +264,7 @@ impl Display for DnsConfig {
                 write!(f, "host: {host}")?;
                 write!(f, "via proxy: {}", proxy.name())
             }
-            DnsConfig::Https(addr, host, iface, proxy, _) => {
+            DnsConfig::Https(addr, host, iface, proxy, ..) => {
                 write!(f, "HTTPS: {}:{} ", addr.ip(), addr.port())?;
                 if let Some(iface) = iface {
                     write!(f, "bind: {iface} ")?;
@@ -469,6 +473,7 @@ impl DnsClient {
                     opts.iface.clone(),
                     opts.proxy.clone(),
                     opts.fw_mark,
+                    opts.path.as_deref().unwrap_or("/dns-query").into(),
                 );
                 Ok(Arc::new(Self {
                     inner: Arc::new(RwLock::new(Inner {
@@ -698,7 +703,7 @@ async fn dns_stream_builder(
             );
             Ok((x, tokio::spawn(y)))
         }
-        DnsConfig::Https(addr, host, iface, proxy, fw_mark) => {
+        DnsConfig::Https(addr, host, iface, proxy, fw_mark, path) => {
             let mut tls_config = ClientConfig::builder()
                 .with_root_certificates(GLOBAL_ROOT_STORE.clone())
                 .with_no_client_auth();
@@ -724,7 +729,7 @@ async fn dns_stream_builder(
                     rule_dispatch.clone(),
                 ),
             )
-            .build(*addr, host.to_string().into(), "/dns-query".into())
+            .build(*addr, host.to_string().into(), path.clone())
             .await
             .map_err(|x| Error::DNSError(x.to_string()))?;
 

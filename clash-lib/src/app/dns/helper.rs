@@ -58,6 +58,7 @@ pub async fn make_clients(
             ecs: edns_client_subnet.clone(),
             fw_mark,
             rule_dispatch: rd,
+            path: s.path.clone(),
         })
         .await
         {

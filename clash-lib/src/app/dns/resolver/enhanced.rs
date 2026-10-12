@@ -71,6 +71,7 @@ impl EnhancedResolver {
                     port: 53,
                     interface: None,
                     proxy: None,
+                    path: None,
                 }],
                 None,
                 std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -958,6 +959,7 @@ mod tests {
             ecs: None,
             fw_mark: None,
             rule_dispatch: None,
+            path: None,
         })
         .await
         .expect("build client");
@@ -978,6 +980,7 @@ mod tests {
             ecs: None,
             fw_mark: None,
             rule_dispatch: None,
+            path: None,
         })
         .await
         .expect("build client");
@@ -998,6 +1001,7 @@ mod tests {
             ecs: None,
             fw_mark: None,
             rule_dispatch: None,
+            path: None,
         })
         .await
         .expect("build client");
@@ -1020,6 +1024,7 @@ mod tests {
             ecs: None,
             fw_mark: None,
             rule_dispatch: None,
+            path: None,
         })
         .await
         .expect("build client");
@@ -1040,6 +1045,7 @@ mod tests {
             ecs: None,
             fw_mark: None,
             rule_dispatch: None,
+            path: None,
         })
         .await
         .expect("build client");
@@ -1111,6 +1117,7 @@ mod tests {
                 port: 53,
                 interface: None,
                 proxy: None,
+                path: None,
             }]),
             default_nameserver: vec![NameServer {
                 net: DNSNetMode::Udp,
@@ -1118,6 +1125,7 @@ mod tests {
                 port: 53,
                 interface: None,
                 proxy: None,
+                path: None,
             }],
             nameserver: vec![NameServer {
                 net: DNSNetMode::Udp,
@@ -1125,6 +1133,7 @@ mod tests {
                 port: 53,
                 interface: None,
                 proxy: None,
+                path: None,
             }],
             ..Default::default()
         };
@@ -1173,6 +1182,7 @@ mod tests {
                 port: 53,
                 interface: None,
                 proxy: None,
+                path: None,
             }],
             nameserver: vec![NameServer {
                 net: DNSNetMode::Udp,
@@ -1180,6 +1190,7 @@ mod tests {
                 port: 53,
                 interface: None,
                 proxy: None,
+                path: None,
             }],
             ..Default::default()
         };
@@ -1244,6 +1255,7 @@ mod tests {
             port: 53,
             interface: None,
             proxy: None,
+            path: None,
         };
         let config = Config {
             enable: true,
@@ -1255,6 +1267,7 @@ mod tests {
                 port: 53,
                 interface: None,
                 proxy: None,
+                path: None,
             }],
             nameserver: vec![NameServer {
                 net: DNSNetMode::Udp,
@@ -1262,6 +1275,7 @@ mod tests {
                 port: 53,
                 interface: None,
                 proxy: None,
+                path: None,
             }],
             ..Default::default()
         };
@@ -1359,6 +1373,7 @@ mod tests {
             port: 53,
             interface: None,
             proxy: None,
+            path: None,
         };
         let ns_policy = NameServer {
             net: DNSNetMode::Udp,
@@ -1366,6 +1381,7 @@ mod tests {
             port: 53,
             interface: None,
             proxy: None,
+            path: None,
         };
 
         let mut nameserver_policy = HashMap::new();

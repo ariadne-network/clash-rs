@@ -101,6 +101,7 @@ impl DhcpClient {
                         port: 53,
                         interface: None,
                         proxy: None,
+                        path: None,
                     })
                     .collect(),
                 None,
