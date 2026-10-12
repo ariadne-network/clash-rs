@@ -136,6 +136,11 @@ pub struct ProxyManager {
     /// Configurable via `CLASH_RS_HEALTHCHECK_CONCURRENCY` env var (default 8).
     /// Limits CPU/memory burst on low-RAM routers when many proxies are alive.
     check_semaphore: Arc<Semaphore>,
+    /// Tests someone asked for (the delay API, `force`), apart from the
+    /// background healthchecks: queued behind a group's round of every
+    /// member, a single test took seconds. Configurable via
+    /// `CLASH_RS_FORCED_CHECK_CONCURRENCY` (default 32).
+    forced_semaphore: Arc<Semaphore>,
 }
 
 #[derive(Clone, Default)]
@@ -158,6 +163,11 @@ impl ProxyManager {
             .and_then(|s| s.parse().ok())
             .filter(|v: &usize| *v > 0)
             .unwrap_or(8);
+        let forced_concurrency = std::env::var("CLASH_RS_FORCED_CHECK_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &usize| *v > 0)
+            .unwrap_or(32);
         Self {
             dns_resolver,
             proxy_state: Default::default(),
@@ -165,6 +175,7 @@ impl ProxyManager {
             check_round: Arc::new(AtomicU64::new(0)),
             backoff_rounds,
             check_semaphore: Arc::new(Semaphore::new(concurrency)),
+            forced_semaphore: Arc::new(Semaphore::new(forced_concurrency)),
         }
     }
 
@@ -249,8 +260,12 @@ impl ProxyManager {
         let mut futs = vec![];
         // Limit concurrency to avoid burst resource consumption on low-RAM
         // routers. Configurable via CLASH_RS_HEALTHCHECK_CONCURRENCY
-        // env var (default 8).
-        let sem = self.check_semaphore.clone();
+        // env var (default 8). Requested tests have permits of their own.
+        let sem = if force {
+            self.forced_semaphore.clone()
+        } else {
+            self.check_semaphore.clone()
+        };
         for outbound in to_test {
             let outbound = outbound.clone();
             let url = url.to_owned();

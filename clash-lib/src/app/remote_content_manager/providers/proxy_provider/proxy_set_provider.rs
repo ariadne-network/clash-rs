@@ -194,8 +194,7 @@ impl ProxySetProvider {
                                     Ok(Arc::new(h) as _)
                                 }
                                 OutboundProxyProtocol::Http(h) => {
-                                    let h: http::outbound::Handler =
-                                        h.try_into()?;
+                                    let h: http::outbound::Handler = h.try_into()?;
                                     Ok(Arc::new(h) as _)
                                 }
                                 OutboundProxyProtocol::Anytls(anytls) => {
