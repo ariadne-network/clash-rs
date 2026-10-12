@@ -40,7 +40,7 @@ use crate::{
         direct::{self},
         fallback,
         group::smart,
-        hysteria2, loadbalance, reject, relay,
+        http, hysteria2, loadbalance, reject, relay,
         selector::{self, ThreadSafeSelectorControl},
         socks, trojan, urltest,
         utils::{DirectConnector, OutboundHandlerRegistry, ProxyConnector},
@@ -360,6 +360,17 @@ impl OutboundManager {
                         })
                         .inspect_err(|e| {
                             error!("failed to load socks5 outbound {}: {}", name, e);
+                        })
+                        .ok()
+                }
+                OutboundProxyProtocol::Http(h) => {
+                    let name = h.common_opts.name.clone();
+                    h.try_into()
+                        .map(|x: http::outbound::Handler| {
+                            Arc::new(x) as AnyOutboundHandler
+                        })
+                        .inspect_err(|e| {
+                            error!("failed to load http outbound {}: {}", name, e);
                         })
                         .ok()
                 }

@@ -4,6 +4,7 @@ pub mod hysteria2;
 pub mod shadowquic;
 #[cfg(feature = "shadowsocks")]
 pub mod shadowsocks;
+pub mod http_proxy;
 pub mod socks5;
 #[cfg(feature = "ssh")]
 pub mod ssh;

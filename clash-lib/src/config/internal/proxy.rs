@@ -56,6 +56,8 @@ pub enum OutboundProxyProtocol {
     Ss(OutboundShadowsocks),
     #[serde(rename = "socks5")]
     Socks5(OutboundSocks5),
+    #[serde(rename = "http")]
+    Http(OutboundHttp),
     #[serde(rename = "anytls")]
     Anytls(OutboundAnytls),
     #[serde(rename = "trojan")]
@@ -94,6 +96,7 @@ impl OutboundProxyProtocol {
             #[cfg(feature = "shadowsocks")]
             OutboundProxyProtocol::Ss(ss) => &ss.common_opts.name,
             OutboundProxyProtocol::Socks5(socks5) => &socks5.common_opts.name,
+            OutboundProxyProtocol::Http(http) => &http.common_opts.name,
             OutboundProxyProtocol::Anytls(anytls) => &anytls.common_opts.name,
             OutboundProxyProtocol::Trojan(trojan) => &trojan.common_opts.name,
             OutboundProxyProtocol::Vmess(vmess) => &vmess.common_opts.name,
@@ -139,6 +142,7 @@ impl Display for OutboundProxyProtocol {
             #[cfg(feature = "shadowsocks")]
             OutboundProxyProtocol::Ss(_) => write!(f, "Shadowsocks"),
             OutboundProxyProtocol::Socks5(_) => write!(f, "Socks5"),
+            OutboundProxyProtocol::Http(_) => write!(f, "Http"),
             OutboundProxyProtocol::Anytls(_) => write!(f, "AnyTLS"),
             OutboundProxyProtocol::Direct(_) => write!(f, "{PROXY_DIRECT}"),
             OutboundProxyProtocol::Reject(_) => write!(f, "{PROXY_REJECT}"),
@@ -199,6 +203,22 @@ pub struct OutboundShadowsocks {
     pub udp: bool,
     pub plugin: Option<String>,
     pub plugin_opts: Option<HashMap<String, serde_yaml::Value>>,
+}
+
+/// An HTTP proxy, reached with CONNECT; over TLS when `tls` is set (an
+/// "HTTPS proxy"). TCP only.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct OutboundHttp {
+    #[serde(flatten)]
+    pub common_opts: CommonConfigOptions,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    #[serde(default = "Default::default")]
+    pub tls: bool,
+    pub sni: Option<String>,
+    #[serde(default = "Default::default")]
+    pub skip_cert_verify: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
