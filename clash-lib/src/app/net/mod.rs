@@ -130,7 +130,29 @@ pub fn get_interface_by_name(name: &str) -> Option<OutboundInterface> {
     Some(outbound)
 }
 
+/// The interface an embedding app knows to be the default network, such
+/// as an iOS packet tunnel that learns it from the system. When it is set
+/// (before the engine starts), `init_net_config` takes it instead of
+/// guessing: the guess prefers interfaces with a global IPv6 address, which
+/// on iOS can be an IPsec interface or cellular while the device is on
+/// Wi-Fi.
+pub static PREFERRED_OUTBOUND_INTERFACE: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
 pub fn get_outbound_interface() -> Option<OutboundInterface> {
+    let preferred = PREFERRED_OUTBOUND_INTERFACE
+        .read()
+        .map(|name| name.clone())
+        .unwrap_or_default();
+    if let Some(name) = preferred
+        && let Some(iface) = network_interface::NetworkInterface::show()
+            .ok()?
+            .into_iter()
+            .find(|iface| iface.name == name)
+    {
+        return Some(iface.into());
+    }
+
     let now = std::time::Instant::now();
 
     let mut all_outbounds = network_interface::NetworkInterface::show()
