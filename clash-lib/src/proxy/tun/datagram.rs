@@ -39,11 +39,13 @@ pub(crate) async fn handle_inbound_datagram(
     // is to the tun
     let udp_stream = TunDatagram::new(l_tx, d_rx);
 
-    let default_outbound = DEFAULT_OUTBOUND_INTERFACE.read().await;
+    // A copy: a guard held here would last as long as the TUN's UDP
+    // handler, and the default interface could never change.
+    let default_outbound = DEFAULT_OUTBOUND_INTERFACE.read().await.clone();
     let sess = Session {
         network: Network::Udp,
         typ: Type::Tun,
-        iface: default_outbound.clone().inspect(|x| {
+        iface: default_outbound.inspect(|x| {
             debug!("selecting outbound interface: {:?} for tun UDP traffic", x);
         }),
         so_mark,
