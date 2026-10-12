@@ -5,12 +5,14 @@ use crate::{
         HandlerCommonOptions,
         transport::{
             GrpcClient, H2Client, RealityClient, TlsClient, TransportLayer,
-            WsClient, XhttpClient,
+            XhttpClient,
         },
         vless::{Handler, HandlerOptions},
     },
 };
 use tracing::warn;
+
+use super::utils::ws_layer;
 
 impl TryFrom<OutboundVless> for Handler {
     type Error = crate::Error;
@@ -135,10 +137,10 @@ impl TryFrom<&OutboundVless> for Handler {
                         .ws_opts
                         .as_ref()
                         .map(|x| {
-                            let client: WsClient = (x, &s.common_opts)
-                                .try_into()
-                                .expect("invalid ws options");
-                            Some(TransportLayer::Ws(client))
+                            Some(
+                                ws_layer(x, &s.common_opts)
+                                    .expect("invalid ws options"),
+                            )
                         })
                         .ok_or(Error::InvalidConfig(
                             "ws_opts is required for ws".to_owned(),

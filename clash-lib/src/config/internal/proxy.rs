@@ -244,6 +244,8 @@ pub struct WsOpt {
     pub headers: Option<HashMap<String, String>>,
     pub max_early_data: Option<i32>,
     pub early_data_header_name: Option<String>,
+    /// HTTP upgrade in place of WebSocket (as mihomo).
+    pub v2ray_http_upgrade: Option<bool>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]

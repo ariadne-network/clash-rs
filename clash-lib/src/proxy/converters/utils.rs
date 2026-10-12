@@ -4,8 +4,28 @@ use http::uri::InvalidUri;
 use crate::{
     Error,
     config::proxy::{CommonConfigOptions, GrpcOpt, H2Opt, WsOpt, XhttpOpt},
-    proxy::transport::{self, GrpcClient, H2Client, WsClient, XhttpClient},
+    proxy::transport::{
+        self, GrpcClient, H2Client, HttpUpgradeClient, TransportLayer, WsClient,
+        XhttpClient,
+    },
 };
+
+/// The layer for `network: ws`: WebSocket, or HTTP upgrade when ws-opts
+/// set `v2ray-http-upgrade` (as mihomo).
+pub(crate) fn ws_layer(
+    x: &WsOpt,
+    common: &CommonConfigOptions,
+) -> std::io::Result<TransportLayer> {
+    if x.v2ray_http_upgrade.unwrap_or(false) {
+        return Ok(TransportLayer::HttpUpgrade(HttpUpgradeClient::new(
+            common.server.to_owned(),
+            common.port,
+            x.path.clone().unwrap_or_default(),
+            x.headers.clone().unwrap_or_default(),
+        )));
+    }
+    Ok(TransportLayer::Ws((x, common).try_into()?))
+}
 
 impl TryFrom<(&WsOpt, &CommonConfigOptions)> for WsClient {
     type Error = std::io::Error;

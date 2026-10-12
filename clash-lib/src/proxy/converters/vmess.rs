@@ -1,13 +1,13 @@
 use tracing::warn;
 
+use super::utils::ws_layer;
+
 use crate::{
     Error,
     config::internal::proxy::OutboundVmess,
     proxy::{
         HandlerCommonOptions,
-        transport::{
-            GrpcClient, H2Client, TlsClient, TransportLayer, WsClient, XhttpClient,
-        },
+        transport::{GrpcClient, H2Client, TlsClient, TransportLayer, XhttpClient},
         vmess::{Handler, HandlerOptions},
     },
 };
@@ -52,10 +52,7 @@ impl TryFrom<&OutboundVmess> for Handler {
                         .ws_opts
                         .as_ref()
                         .map(|x| {
-                            let client: WsClient = (x, &s.common_opts)
-                                .try_into()
-                                .expect("invalid ws options");
-                            TransportLayer::Ws(client)
+                            ws_layer(x, &s.common_opts).expect("invalid ws options")
                         })
                         .ok_or(Error::InvalidConfig(
                             "ws_opts is required for ws".to_owned(),

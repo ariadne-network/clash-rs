@@ -1,5 +1,6 @@
 mod grpc;
 mod h2;
+mod http_upgrade;
 mod reality;
 #[cfg(feature = "shadowsocks")]
 mod shadow_tls;
@@ -14,6 +15,7 @@ mod xhttp;
 
 pub use grpc::Client as GrpcClient;
 pub use h2::Client as H2Client;
+pub use http_upgrade::Client as HttpUpgradeClient;
 pub use reality::Client as RealityClient;
 #[cfg(feature = "shadowsocks")]
 pub use shadow_tls::Client as Shadowtls;
@@ -78,6 +80,7 @@ pub enum TransportLayer {
     Grpc(GrpcClient),
     H2(H2Client),
     Ws(WsClient),
+    HttpUpgrade(HttpUpgradeClient),
     Xhttp(XhttpClient),
     #[cfg(feature = "shadowsocks")]
     ShadowTls(Shadowtls),
@@ -100,6 +103,7 @@ impl TransportLayer {
             Self::Grpc(t) => Transport::proxy_stream(t, stream).await,
             Self::H2(t) => Transport::proxy_stream(t, stream).await,
             Self::Ws(t) => Transport::proxy_stream(t, stream).await,
+            Self::HttpUpgrade(t) => Transport::proxy_stream(t, stream).await,
             Self::Xhttp(t) => Transport::proxy_stream(t, stream).await,
             #[cfg(feature = "shadowsocks")]
             Self::ShadowTls(t) => Transport::proxy_stream(t, stream).await,

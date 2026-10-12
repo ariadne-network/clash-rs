@@ -1,5 +1,7 @@
 use tracing::warn;
 
+use super::utils::ws_layer;
+
 const DEFAULT_ALPN: [&str; 2] = ["h2", "http/1.1"];
 const DEFAULT_WS_ALPN: [&str; 1] = ["http/1.1"];
 
@@ -8,7 +10,7 @@ use crate::{
     config::internal::proxy::OutboundTrojan,
     proxy::{
         HandlerCommonOptions,
-        transport::{GrpcClient, TlsClient, TransportLayer, WsClient},
+        transport::{GrpcClient, TlsClient, TransportLayer},
         trojan::{Handler, HandlerOptions},
     },
 };
@@ -77,10 +79,7 @@ impl TryFrom<&OutboundTrojan> for Handler {
                         .ws_opts
                         .as_ref()
                         .map(|x| {
-                            let client: WsClient = (x, &s.common_opts)
-                                .try_into()
-                                .expect("invalid ws_opts");
-                            TransportLayer::Ws(client)
+                            ws_layer(x, &s.common_opts).expect("invalid ws_opts")
                         })
                         .ok_or(Error::InvalidConfig(
                             "ws_opts is required for ws".to_owned(),
