@@ -5,7 +5,9 @@ version = { workspace = true }
 edition = { workspace = true }
 
 [features]
-default = ["zero_copy", "aws-lc-rs", "dashboard"]
+default = ["zero_copy", "aws-lc-rs", "dashboard", "process-rules"]
+# PROCESS-NAME rules on Linux, macOS and Windows (sock2proc).
+process-rules = ["dep:sock2proc"]
 
 aws-lc-rs = [
     "dep:aws-lc-rs",
@@ -252,7 +254,7 @@ protox = "0.9"
 anyhow = "1"
 
 [target.'cfg(any(target_os="linux", target_os="macos", target_os="windows"))'.dependencies]
-sock2proc = { git = "https://github.com/Watfaq/sock2proc.git", rev = "9f9e630" }
+sock2proc = { git = "https://github.com/Watfaq/sock2proc.git", rev = "9f9e630", optional = true }
 [target.'cfg(unix)'.dependencies]
 hyperlocal = { version = "0.9", features = ["client"] }
 

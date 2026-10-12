@@ -15,7 +15,10 @@ impl std::fmt::Display for Process {
 
 impl RuleMatcher for Process {
     fn apply(&self, sess: &crate::session::Session) -> bool {
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        #[cfg(all(
+            feature = "process-rules",
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
+        ))]
         {
             use crate::session::Network;
             use tracing::debug;
@@ -37,10 +40,9 @@ impl RuleMatcher for Process {
                 }
             })
         }
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "windows"
+        #[cfg(not(all(
+            feature = "process-rules",
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
         )))]
         {
             use tracing::info;
