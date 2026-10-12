@@ -17,10 +17,7 @@ use tokio_tungstenite::{
     },
 };
 
-use crate::{
-    common::errors::new_io_error,
-    proxy::AnyStream,
-};
+use crate::{common::errors::new_io_error, proxy::AnyStream};
 
 use super::websocket::WebsocketConn;
 
@@ -84,7 +81,9 @@ impl WebsocketEarlyDataConn {
     }
 
     fn failed(&self) -> Option<std::io::Error> {
-        self.failure.as_ref().map(|(kind, message)| std::io::Error::new(*kind, message.clone()))
+        self.failure
+            .as_ref()
+            .map(|(kind, message)| std::io::Error::new(*kind, message.clone()))
     }
 
     fn proxy_stream(
@@ -266,7 +265,9 @@ async fn handshake(
         }
     }
     for (name, value) in req.headers() {
-        let value = value.to_str().map_err(|e| new_io_error(format!("header {name}: {e}")))?;
+        let value = value
+            .to_str()
+            .map_err(|e| new_io_error(format!("header {name}: {e}")))?;
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("\r\n");
@@ -278,7 +279,9 @@ async fn handshake(
     let mut byte = [0u8; 1];
     while !response.ends_with(b"\r\n\r\n") {
         if response.len() > 16 * 1024 {
-            return Err(new_io_error("websocket handshake: response header too long"));
+            return Err(new_io_error(
+                "websocket handshake: response header too long",
+            ));
         }
         if stream.read(&mut byte).await? == 0 {
             return Err(new_io_error("websocket handshake: connection closed"));
@@ -289,7 +292,9 @@ async fn handshake(
     let mut lines = response.split("\r\n");
     let status = lines.next().unwrap_or_default();
     if status.split_whitespace().nth(1) != Some("101") {
-        return Err(new_io_error(format!("websocket handshake failed: {status}")));
+        return Err(new_io_error(format!(
+            "websocket handshake failed: {status}"
+        )));
     }
     let accept = lines
         .filter_map(|l| l.split_once(':'))
@@ -300,7 +305,9 @@ async fn handshake(
         .get("Sec-WebSocket-Key")
         .ok_or_else(|| new_io_error("websocket handshake: no key"))?;
     if accept.as_deref() != Some(derive_accept_key(key.as_bytes()).as_str()) {
-        return Err(new_io_error("websocket handshake: wrong Sec-WebSocket-Accept"));
+        return Err(new_io_error(
+            "websocket handshake: wrong Sec-WebSocket-Accept",
+        ));
     }
     Ok(WebSocketStream::from_raw_socket(stream, Role::Client, config).await)
 }
@@ -311,7 +318,11 @@ mod tests {
     use tokio::io::duplex;
 
     /// A server that takes the early data but does not echo the header.
-    async fn serve(mut server: tokio::io::DuplexStream, echo: bool, accept_right: bool) {
+    async fn serve(
+        mut server: tokio::io::DuplexStream,
+        echo: bool,
+        accept_right: bool,
+    ) {
         let mut request = Vec::new();
         let mut byte = [0u8; 1];
         while !request.ends_with(b"\r\n\r\n") {
@@ -323,12 +334,23 @@ mod tests {
         let text = String::from_utf8_lossy(&request).to_string();
         let key = text
             .lines()
-            .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: ").or_else(|| l.strip_prefix("sec-websocket-key: ")))
+            .find_map(|l| {
+                l.strip_prefix("Sec-WebSocket-Key: ")
+                    .or_else(|| l.strip_prefix("sec-websocket-key: "))
+            })
             .unwrap_or_default()
             .trim()
             .to_owned();
-        let accept = if accept_right { derive_accept_key(key.as_bytes()) } else { "nope".into() };
-        let protocol = if echo { "Sec-WebSocket-Protocol: x\r\n" } else { "" };
+        let accept = if accept_right {
+            derive_accept_key(key.as_bytes())
+        } else {
+            "nope".into()
+        };
+        let protocol = if echo {
+            "Sec-WebSocket-Protocol: x\r\n"
+        } else {
+            ""
+        };
         let _ = server
             .write_all(format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n{protocol}\r\n").as_bytes())
             .await;
@@ -342,7 +364,10 @@ mod tests {
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
             .header("Sec-WebSocket-Version", "13")
-            .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
+            .header(
+                "Sec-WebSocket-Key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            )
             .header("Sec-WebSocket-Protocol", "ZWFybHk")
             .body(())
             .unwrap()
@@ -353,7 +378,10 @@ mod tests {
         for echo in [false, true] {
             let (client, server) = duplex(4096);
             let server = tokio::spawn(serve(server, echo, true));
-            assert!(handshake(Box::new(client), request(), None).await.is_ok(), "echo {echo}");
+            assert!(
+                handshake(Box::new(client), request(), None).await.is_ok(),
+                "echo {echo}"
+            );
             let _ = server.await;
         }
         let (client, server) = duplex(4096);
@@ -366,7 +394,13 @@ mod tests {
     async fn a_failed_handshake_fails_every_call() {
         let (client, server) = duplex(4096);
         drop(server);
-        let mut conn = WebsocketEarlyDataConn::new(Box::new(client), request(), None, "Sec-WebSocket-Protocol".into(), 2048);
+        let mut conn = WebsocketEarlyDataConn::new(
+            Box::new(client),
+            request(),
+            None,
+            "Sec-WebSocket-Protocol".into(),
+            2048,
+        );
         assert!(conn.write_all(b"vless request").await.is_err());
         // Polling again used to panic ("async fn resumed after completion").
         assert!(conn.write_all(b"more").await.is_err());

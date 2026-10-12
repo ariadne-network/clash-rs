@@ -74,6 +74,19 @@ impl Client {
         for (k, v) in self.headers.iter() {
             request = request.header(k.as_str(), v.as_str());
         }
+        // tungstenite refuses a request without Host ("Missing, duplicated
+        // or incorrect header host"), and nodes often name none: the
+        // server, as the URI has it.
+        if !self.headers.keys().any(|k| k.eq_ignore_ascii_case("host")) {
+            let host = match self.port {
+                80 | 443 => self.server.clone(),
+                port if self.server.contains(':') => {
+                    format!("[{}]:{port}", self.server)
+                }
+                port => format!("{}:{port}", self.server),
+            };
+            request = request.header("Host", host);
+        }
         if self.max_early_data > 0 {
             // we will replace this field later
             request = request.header(self.early_data_header_name.as_str(), "xxoo");
