@@ -49,7 +49,7 @@ async fn proxy(
     authenticator: ThreadSafeAuthenticator,
     fw_mark: Option<u32>,
 ) -> Result<Response<BoxBody<Bytes, std::io::Error>>, ProxyError> {
-    if authenticator.enabled()
+    if authenticator.required_for(&src)
         && let Some(res) = authenticate_req(&req, authenticator)
     {
         return Ok(res);

@@ -51,7 +51,7 @@ pub async fn handle_tcp(
         let mut response = [SOCKS5_VERSION, auth_methods::NO_METHODS];
         let methods = &buf[..];
 
-        if authenticator.enabled() {
+        if authenticator.required_for(&sess.source) {
             if !methods.contains(&auth_methods::USER_PASS) {
                 response[1] = response_code::FAILURE;
                 s.write_all(&response).await?;
