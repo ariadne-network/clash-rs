@@ -680,6 +680,9 @@ async fn create_components(
         .and_then(|e| e.closed_flows_cap)
         .unwrap_or(crate::app::dispatcher::DEFAULT_CLOSED_FLOWS_CAP);
     crate::app::dispatcher::set_closed_flows_cap(closed_flows_cap);
+    crate::app::remote_content_manager::set_unified_delay(
+        config.experimental.as_ref().is_some_and(|e| e.unified_delay),
+    );
 
     // Set AnyTLS buffer sizes from experimental config (or reset to defaults)
     let duplex = config

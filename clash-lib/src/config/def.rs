@@ -754,6 +754,11 @@ pub struct Experimental {
     pub closed_flows_cap: Option<usize>,
     #[serde(default)]
     pub ignore_resolve_fail: bool,
+    /// Latency tests time a second request on the same connection, as
+    /// mihomo's unified-delay: the connection to the proxy, its handshakes
+    /// and the proxy reaching the test site do not count.
+    #[serde(default)]
+    pub unified_delay: bool,
 }
 
 #[derive(Serialize, Deserialize)]

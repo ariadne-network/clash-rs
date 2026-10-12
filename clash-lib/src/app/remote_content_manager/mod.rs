@@ -143,6 +143,15 @@ pub struct ProxyManager {
     forced_semaphore: Arc<Semaphore>,
 }
 
+/// `experimental.unified-delay`: latency tests time a second request on
+/// the same connection.
+static UNIFIED_DELAY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_unified_delay(on: bool) {
+    UNIFIED_DELAY.store(on, std::sync::atomic::Ordering::Release);
+}
+
 #[derive(Clone, Default)]
 pub struct SiteTuning {
     pub delay_weight: Option<f64>,
@@ -981,18 +990,25 @@ impl ProxyManager {
                 }
             };
 
-            let req = Request::get(url)
-                .header(hyper::header::HOST, host.as_str())
-                .header("Connection", "Close")
-                .version(hyper::Version::HTTP_11)
-                .body(Empty::<Bytes>::new())
-                .unwrap();
+            // Unified delay: the first request opens the way (the proxy
+            // reaches the test site), the second one is timed.
+            let unified = UNIFIED_DELAY.load(std::sync::atomic::Ordering::Acquire);
+            let request = |close: bool| {
+                let mut builder = Request::get(url)
+                    .header(hyper::header::HOST, host.as_str())
+                    .version(hyper::Version::HTTP_11);
+                if close {
+                    builder = builder.header("Connection", "Close");
+                }
+                builder.body(Empty::<Bytes>::new()).unwrap()
+            };
+            let req = request(!unified);
 
             let mut tls_handshake_delay = None;
-            let resp = match uri.scheme() {
+            let mut sender = match uri.scheme() {
                 Some(scheme) if scheme == &http::uri::Scheme::HTTP => {
                     let io = TokioIo::new(stream);
-                    let (mut sender, conn) = tokio::time::timeout(
+                    let (sender, conn) = tokio::time::timeout(
                         timeout,
                         hyper::client::conn::http1::handshake(io),
                     )
@@ -1008,7 +1024,7 @@ impl ProxyManager {
                         }
                     });
 
-                    TimedFuture::new(sender.send_request(req).boxed())
+                    sender
                 }
                 Some(scheme) if scheme == &http::uri::Scheme::HTTPS => {
                     let mut tls_config = rustls::ClientConfig::builder()
@@ -1026,7 +1042,7 @@ impl ProxyManager {
                     let (stream, delay) = tokio::time::timeout(
                         timeout,
                         TimedFuture::new(connector.connect(
-                            host.try_into().expect("must be valid SNI"),
+                            host.clone().try_into().expect("must be valid SNI"),
                             stream,
                         )),
                     )
@@ -1036,7 +1052,7 @@ impl ProxyManager {
 
                     let io = TokioIo::new(stream);
 
-                    let (mut sender, conn) = tokio::time::timeout(
+                    let (sender, conn) = tokio::time::timeout(
                         timeout,
                         hyper::client::conn::http1::handshake(io),
                     )
@@ -1054,7 +1070,7 @@ impl ProxyManager {
 
                     tls_handshake_delay = Some(delay);
 
-                    TimedFuture::new(sender.send_request(req).boxed())
+                    sender
                 }
                 _ => {
                     return Err(new_io_error(format!(
@@ -1063,7 +1079,8 @@ impl ProxyManager {
                 }
             };
 
-            let delay = match tokio::time::timeout(timeout, resp).await {
+            let resp = TimedFuture::new(sender.send_request(req).boxed());
+            let mut delay = match tokio::time::timeout(timeout, resp).await {
                 Ok((res, delay)) => match res {
                     Ok(res) => {
                         trace!(
@@ -1071,6 +1088,15 @@ impl ProxyManager {
                             status = ?res.status(),
                             "success"
                         );
+                        if unified {
+                            // Read to the end, so the connection can carry
+                            // the next request.
+                            let _ = tokio::time::timeout(
+                                timeout,
+                                http_body_util::BodyExt::collect(res.into_body()),
+                            )
+                            .await;
+                        }
                         Ok(delay)
                     }
                     Err(e) => {
@@ -1089,9 +1115,24 @@ impl ProxyManager {
                 }
             }?;
 
+            let first = delay;
+            if unified
+                && tokio::time::timeout(timeout, sender.ready())
+                    .await
+                    .is_ok_and(|r| r.is_ok())
+            {
+                let second =
+                    TimedFuture::new(sender.send_request(request(true)).boxed());
+                if let Ok((Ok(_), second)) =
+                    tokio::time::timeout(timeout, second).await
+                {
+                    delay = second;
+                }
+            }
+
             Ok((
                 delay,
-                (connect_delay + tls_handshake_delay.unwrap_or_default() + delay),
+                (connect_delay + tls_handshake_delay.unwrap_or_default() + first),
             ))
         };
 
