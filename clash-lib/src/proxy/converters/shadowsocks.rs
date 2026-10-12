@@ -202,11 +202,14 @@ impl TryFrom<HashMap<String, serde_yaml::Value>> for Shadowtls {
             .get("strict")
             .and_then(|x| x.as_bool())
             .unwrap_or(true);
+        let skip_cert_verify = value
+            .get("skip-cert-verify")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
 
-        Ok(Shadowtls::new(
-            host.to_string(),
-            password.to_string(),
-            strict,
-        ))
+        Ok(
+            Shadowtls::new(host.to_string(), password.to_string(), strict)
+                .with_skip_cert_verify(skip_cert_verify),
+        )
     }
 }

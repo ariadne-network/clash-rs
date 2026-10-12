@@ -28,6 +28,24 @@ pub use v2ray::{V2RayOBFSOption, V2rayWsClient};
 pub use ws::Client as WsClient;
 pub use xhttp::Client as XhttpClient;
 
+/// The default provider offering X25519 alone. REALITY authenticates with
+/// the X25519 key share, and ShadowTLS v3 signs the session id; both break
+/// on a HelloRetryRequest, which a server sends when it prefers a group the
+/// client listed but sent no share for (Go and many sites now prefer
+/// X25519MLKEM768): rustls then fails with
+/// IllegalHelloRetryRequestWithWrongSessionId.
+pub(crate) fn x25519_only_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider>
+{
+    crate::setup_default_crypto_provider();
+    let mut provider = rustls::crypto::CryptoProvider::get_default()
+        .map(|p| (**p).clone())
+        .expect("a default crypto provider");
+    provider
+        .kx_groups
+        .retain(|g| g.name() == rustls::NamedGroup::X25519);
+    std::sync::Arc::new(provider)
+}
+
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
     async fn proxy_stream(

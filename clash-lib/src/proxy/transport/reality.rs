@@ -54,10 +54,13 @@ impl Client {
                 io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
             })?;
 
-        let tls_config = ClientConfig::builder()
-            .with_root_certificates(self.roots.get_or_init(init_roots).clone())
-            .with_reality(reality)
-            .with_no_client_auth();
+        let tls_config =
+            ClientConfig::builder_with_provider(super::x25519_only_provider())
+                .with_safe_default_protocol_versions()
+                .map_err(io::Error::other)?
+                .with_root_certificates(self.roots.get_or_init(init_roots).clone())
+                .with_reality(reality)
+                .with_no_client_auth();
 
         let sni: ServerName<'_> =
             ServerName::try_from(self.sni.clone()).map_err(|e| {

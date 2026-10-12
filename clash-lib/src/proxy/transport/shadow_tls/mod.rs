@@ -12,7 +12,10 @@ mod utils;
 
 use super::Transport;
 use crate::{
-    common::{errors::map_io_error, tls::GLOBAL_ROOT_STORE},
+    common::{
+        errors::map_io_error,
+        tls::{DefaultTlsVerifier, GLOBAL_ROOT_STORE},
+    },
     proxy::AnyStream,
 };
 use prelude::*;
@@ -21,6 +24,7 @@ pub struct Client {
     host: String,
     password: String,
     strict: bool,
+    skip_cert_verify: bool,
 }
 
 impl Client {
@@ -29,7 +33,15 @@ impl Client {
             host,
             password,
             strict,
+            skip_cert_verify: false,
         }
+    }
+
+    /// Accept any certificate from the handshake server (mihomo's
+    /// `skip-cert-verify`), for one with a self-signed certificate.
+    pub fn with_skip_cert_verify(mut self, skip: bool) -> Self {
+        self.skip_cert_verify = skip;
+        self
     }
 
     pub async fn wrap_shadow_tls_stream(
@@ -44,7 +56,7 @@ impl Client {
             .map_err(map_io_error)?;
         let session_id_generator =
             move |data: &_| generate_session_id(&hamc_handshake, data);
-        let connector = new_connector();
+        let connector = new_connector(self.skip_cert_verify);
         let mut tls = connector
             .connect_with_session_id_generator(
                 sni_name,
@@ -114,10 +126,23 @@ impl Transport for Client {
     }
 }
 
-fn new_connector() -> TlsConnector {
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(GLOBAL_ROOT_STORE.clone())
-        .with_no_client_auth();
+fn new_connector(skip_cert_verify: bool) -> TlsConnector {
+    let builder =
+        rustls::ClientConfig::builder_with_provider(super::x25519_only_provider())
+            .with_safe_default_protocol_versions()
+            .expect("TLS 1.2 and 1.3 with the default provider");
+    let tls_config = if skip_cert_verify {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(DefaultTlsVerifier::new(
+                None, true,
+            )))
+            .with_no_client_auth()
+    } else {
+        builder
+            .with_root_certificates(GLOBAL_ROOT_STORE.clone())
+            .with_no_client_auth()
+    };
 
     TlsConnector::from(Arc::new(tls_config))
 }
