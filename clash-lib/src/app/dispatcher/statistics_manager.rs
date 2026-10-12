@@ -143,6 +143,9 @@ pub struct ClosedFlowInfo {
     pub download_total: u64,
     #[serde(rename = "start")]
     pub start_time: chrono::DateTime<Utc>,
+    /// When the connection closed.
+    #[serde(rename = "end")]
+    pub end_time: chrono::DateTime<Utc>,
     #[serde(rename = "chains")]
     pub proxy_chain: Vec<String>,
     #[serde(rename = "rule")]
@@ -169,6 +172,7 @@ impl ClosedFlowInfo {
             upload_total: info.upload_total.load(Ordering::Acquire),
             download_total: info.download_total.load(Ordering::Acquire),
             start_time: info.start_time,
+            end_time: Utc::now(),
             proxy_chain: chain,
             rule: info.rule.clone(),
             rule_payload: info.rule_payload.clone(),

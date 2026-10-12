@@ -37,8 +37,18 @@ pub fn routes(
 ) -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(get_connections).delete(close_all_connection))
+        .route("/closed", get(get_closed_connections))
         .route("/{id}", delete(close_connection))
         .with_state(ConnectionState { components })
+}
+
+/// The recently closed connections, oldest first (the ring buffer behind
+/// /flows, `experimental.closed-flows-cap` of them): a client polling
+/// /connections misses the ones that opened and closed in between.
+async fn get_closed_connections(
+    State(state): State<ConnectionState>,
+) -> impl IntoResponse {
+    Json(state.statistics_manager().closed_flows_snapshot().await).into_response()
 }
 
 #[derive(Deserialize)]
