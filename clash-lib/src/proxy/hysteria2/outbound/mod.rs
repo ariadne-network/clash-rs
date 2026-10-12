@@ -8,7 +8,7 @@ use crate::{
     app::{
         dispatcher::{
             BoxedInstrumentedDatagram, BoxedInstrumentedStream,
-            InstrumentedDatagram, InstrumentedDatagramWrapper,
+            InstrumentedDatagram, InstrumentedDatagramWrapper, InstrumentedStream,
             InstrumentedStreamWrapper,
         },
         dns::ThreadSafeDNSResolver,
@@ -416,9 +416,12 @@ impl OutboundHandler for Handler {
     ) -> std::io::Result<BoxedInstrumentedStream> {
         let authed_conn = self.new_authed_connection(sess, resolver.clone()).await?;
         let hy_stream = authed_conn.connect_tcp(sess).await?;
-        Ok(Box::new(InstrumentedStreamWrapper::new(
-            Box::new(hy_stream) as crate::proxy::AnyStream,
-        )))
+        let s = InstrumentedStreamWrapper::new(
+            Box::new(hy_stream) as crate::proxy::AnyStream
+        );
+        // The connection list shows the chain (like connect_datagram).
+        s.append_to_chain(self.name()).await;
+        Ok(Box::new(s))
     }
 
     /// connect to remote target via UDP
