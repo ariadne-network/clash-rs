@@ -15,7 +15,7 @@ use crate::{
         dns::ThreadSafeDNSResolver,
     },
     impl_default_connector,
-    proxy::vless::datagram::OutboundDatagramVless,
+    proxy::vless::{datagram::OutboundDatagramVless, xudp::OutboundDatagramXudp},
     session::Session,
 };
 use async_trait::async_trait;
@@ -26,6 +26,7 @@ use tracing::debug;
 mod datagram;
 mod stream;
 mod vision;
+mod xudp;
 
 pub struct HandlerOptions {
     pub name: String,
@@ -87,6 +88,11 @@ impl Handler {
             is_udp,
             self.opts.flow.clone(),
         )?;
+        let vless_stream = if is_udp && self.xudp() {
+            vless_stream.with_mux()
+        } else {
+            vless_stream
+        };
 
         if self.opts.flow.as_deref() == Some("xtls-rprx-vision") {
             Ok(Box::new(VisionStream::new(
@@ -97,6 +103,11 @@ impl Handler {
         } else {
             Ok(Box::new(vless_stream))
         }
+    }
+
+    /// UDP as XUDP: servers refuse the UDP command with the Vision flow.
+    fn xudp(&self) -> bool {
+        self.opts.flow.as_deref() == Some("xtls-rprx-vision")
     }
 }
 
@@ -207,6 +218,12 @@ impl OutboundHandler for Handler {
             .await?;
 
         let stream = self.inner_proxy_stream(stream, sess, true).await?;
+        if self.xudp() {
+            let d = OutboundDatagramXudp::new(stream, sess.destination.clone());
+            let chained = InstrumentedDatagramWrapper::new(d);
+            chained.append_to_chain(self.name()).await;
+            return Ok(Box::new(chained));
+        }
         let d = OutboundDatagramVless::new(stream, sess.destination.clone());
 
         let chained = InstrumentedDatagramWrapper::new(d);

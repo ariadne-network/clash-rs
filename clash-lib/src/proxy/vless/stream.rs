@@ -13,6 +13,7 @@ use crate::{proxy::AnyStream, session::SocksAddr};
 const VLESS_VERSION: u8 = 0;
 const VLESS_COMMAND_TCP: u8 = 1;
 const VLESS_COMMAND_UDP: u8 = 2;
+const VLESS_COMMAND_MUX: u8 = 3;
 
 pub struct VlessStream {
     inner: AnyStream,
@@ -22,6 +23,7 @@ pub struct VlessStream {
     uuid: uuid::Uuid,
     destination: SocksAddr,
     is_udp: bool,
+    mux: bool,
     flow: Option<String>,
 }
 
@@ -47,8 +49,15 @@ impl VlessStream {
             uuid,
             destination: destination.clone(),
             is_udp,
+            mux: false,
             flow,
         })
+    }
+
+    /// The Mux.Cool command (no address): XUDP (see xudp.rs).
+    pub fn with_mux(mut self) -> Self {
+        self.mux = true;
+        self
     }
 
     fn build_handshake_header(&self) -> BytesMut {
@@ -69,6 +78,10 @@ impl VlessStream {
             buf.put_u8(0); // No addon
         }
 
+        if self.mux {
+            buf.put_u8(VLESS_COMMAND_MUX);
+            return buf;
+        }
         if self.is_udp {
             buf.put_u8(VLESS_COMMAND_UDP);
         } else {
@@ -295,6 +308,22 @@ mod tests {
         assert_eq!(addon[0], 0x0A);
         assert_eq!(addon[1], flow.len() as u8);
         assert_eq!(&addon[2..], flow.as_bytes());
+    }
+
+    #[test]
+    fn test_handshake_header_mux_has_no_address() {
+        let s = VlessStream::new(
+            dummy_stream(),
+            "5415d8e0-df92-3655-afa4-b79de66413f5",
+            &tcp_dest(),
+            false,
+            None,
+        )
+        .unwrap()
+        .with_mux();
+        let hdr = s.build_handshake_header();
+        assert_eq!(hdr.len(), 19);
+        assert_eq!(hdr[18], VLESS_COMMAND_MUX);
     }
 
     // --- new() ---
