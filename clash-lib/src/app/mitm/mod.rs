@@ -20,6 +20,7 @@
 //! sessions and HTTP buffers each.
 
 mod ca;
+mod fetch;
 mod rewrite;
 
 use std::{
@@ -50,7 +51,9 @@ use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 use tracing::{debug, info, warn};
 
 pub use ca::{Authority, generate_ca};
-pub use rewrite::{RewriteConfig, Rewriter};
+pub(crate) use fetch::set_dispatcher;
+pub use fetch::{engine_runtime, fetch};
+pub use rewrite::{Collected, RewriteConfig, Rewriter, collect, decompress};
 
 use crate::{
     common::{
@@ -59,10 +62,24 @@ use crate::{
     },
     config::def::MitmConfig,
     proxy::ProxyStream,
-    session::{Network, Session, SocksAddr},
+    session::{Network, Session, SocksAddr, Type},
 };
 
 pub type Body = BoxBody<Bytes, hyper::Error>;
+
+/// What a response's processing knows of its request (the request as it
+/// was sent, after the request's processing).
+pub struct RequestHead {
+    pub method: Method,
+    pub headers: http::HeaderMap,
+    /// The request's `RequestId`.
+    pub id: u64,
+}
+
+/// A request's number, the same for its request and response processing:
+/// in the request's extensions.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestId(pub u64);
 
 /// What happens to a request: it goes on (maybe changed), or gets an
 /// answer here.
@@ -90,7 +107,7 @@ pub trait HttpProcessor: Send + Sync {
     async fn response(
         &self,
         _url: &str,
-        _method: &Method,
+        _request: &RequestHead,
         resp: Response<Body>,
     ) -> Response<Body> {
         resp
@@ -101,6 +118,42 @@ pub trait HttpProcessor: Send + Sync {
 pub struct Passthrough;
 
 impl HttpProcessor for Passthrough {}
+
+/// The application's processor that runs after the rewrites (scripts),
+/// set before the engine starts.
+static AFTER_REWRITES: std::sync::RwLock<Option<Arc<dyn HttpProcessor>>> =
+    std::sync::RwLock::new(None);
+
+pub fn set_processor_after_rewrites(processor: Option<Arc<dyn HttpProcessor>>) {
+    *AFTER_REWRITES.write().unwrap() = processor;
+}
+
+/// One processor, then the other.
+struct Chain(Arc<dyn HttpProcessor>, Arc<dyn HttpProcessor>);
+
+#[async_trait]
+impl HttpProcessor for Chain {
+    fn wants(&self, url: &str) -> bool {
+        self.0.wants(url) || self.1.wants(url)
+    }
+
+    async fn request(&self, url: &str, req: Request<Body>) -> RequestOutcome {
+        match self.0.request(url, req).await {
+            RequestOutcome::Forward(req) => self.1.request(url, req).await,
+            other => other,
+        }
+    }
+
+    async fn response(
+        &self,
+        url: &str,
+        request: &RequestHead,
+        resp: Response<Body>,
+    ) -> Response<Body> {
+        let resp = self.0.response(url, request, resp).await;
+        self.1.response(url, request, resp).await
+    }
+}
 
 /// A body of these bytes.
 pub fn full_body(bytes: impl Into<Bytes>) -> Body {
@@ -149,7 +202,8 @@ impl Mitm {
             }) if !hosts.is_empty() => Some(Authority::new(cert, key)?),
             _ => None,
         };
-        if authority.is_none() && rewrite.is_none() {
+        let after = AFTER_REWRITES.read().unwrap().clone();
+        if authority.is_none() && rewrite.is_none() && after.is_none() {
             return Ok(None);
         }
         let skip = mitm.is_some_and(|m| m.skip_server_cert_verify);
@@ -164,9 +218,13 @@ impl Mitm {
             Arc::new(c)
         };
         let _ = &GLOBAL_ROOT_STORE; // the verifier's roots
-        let processor: Arc<dyn HttpProcessor> = match rewrite {
-            Some(r) => Arc::new(Rewriter::new(r.clone())),
-            None => Arc::new(Passthrough),
+        let rewriter: Option<Arc<dyn HttpProcessor>> =
+            rewrite.map(|r| Arc::new(Rewriter::new(r.clone())) as _);
+        let processes = rewriter.is_some() || after.is_some();
+        let processor: Arc<dyn HttpProcessor> = match (rewriter, after) {
+            (Some(r), Some(a)) => Arc::new(Chain(r, a)),
+            (Some(p), None) | (None, Some(p)) => p,
+            (None, None) => Arc::new(Passthrough),
         };
         Ok(Some(Arc::new(Self {
             hosts,
@@ -175,7 +233,7 @@ impl Mitm {
                 rewrite.map_or(&[][..], |r| &r.force_http_engine_hosts),
                 80,
             ),
-            rewrites: rewrite.is_some(),
+            rewrites: processes,
             h2: mitm.is_some_and(|m| m.h2),
             quic_block: mitm.is_some_and(|m| m.auto_quic_block),
             processor,
@@ -188,7 +246,9 @@ impl Mitm {
     /// Whether this TCP connection may be decrypted or read as HTTP
     /// (`serve`).
     pub fn handles(&self, sess: &Session) -> bool {
+        // Not the engine's own requests (`fetch`: scripts).
         sess.network == Network::Tcp
+            && sess.typ != Type::Ignore
             && (self.decrypts(&sess.destination)
                 || self.decrypts_by_name(&sess.destination)
                 || self.reads_plain(&sess.destination))
@@ -741,13 +801,20 @@ impl Site {
     ) -> Result<Response<Body>, Dropped> {
         let url = self.url(&req);
         let client_upgrade = is_upgrade(&req).then(|| hyper::upgrade::on(&mut req));
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        req.extensions_mut().insert(RequestId(id));
         let req = req.map(BodyExt::boxed);
         let req = match self.mitm.processor.request(&url, req).await {
             RequestOutcome::Forward(req) => req,
             RequestOutcome::Respond(resp) => return Ok(resp),
             RequestOutcome::Drop => return Err(Dropped),
         };
-        let method = req.method().clone();
+        let head = RequestHead {
+            method: req.method().clone(),
+            headers: req.headers().clone(),
+            id,
+        };
         let mut resp = match upstream.send(req).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -774,7 +841,7 @@ impl Site {
             });
         }
         let resp = resp.map(BodyExt::boxed);
-        Ok(self.mitm.processor.response(&url, &method, resp).await)
+        Ok(self.mitm.processor.response(&url, &head, resp).await)
     }
 
     /// The full URL: HTTP/2 requests carry it, HTTP/1.1 ones the path and

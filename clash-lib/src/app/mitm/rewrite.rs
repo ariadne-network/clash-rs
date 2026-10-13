@@ -12,9 +12,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
-use http::{
-    HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, header,
-};
+use http::{HeaderName, HeaderValue, Request, Response, StatusCode, Uri, header};
 use http_body_util::{BodyExt, BodyStream, StreamBody};
 use hyper::body::Frame;
 use tracing::{debug, warn};
@@ -375,12 +373,15 @@ fn reject(kind: &str) -> Option<Response<Body>> {
 
 /// A body read whole, or one larger than the limit: what was read, then
 /// the rest, as it comes.
-enum Collected {
+pub enum Collected {
     Whole(Bytes),
     TooLarge(Body),
 }
 
-async fn collect(mut body: Body, limit: usize) -> Result<Collected, hyper::Error> {
+pub async fn collect(
+    mut body: Body,
+    limit: usize,
+) -> Result<Collected, hyper::Error> {
     let mut buf = BytesMut::new();
     while let Some(frame) = body.frame().await {
         // Trailers are dropped: nothing rewritten carries any.
@@ -400,7 +401,8 @@ async fn collect(mut body: Body, limit: usize) -> Result<Collected, hyper::Error
     Ok(Collected::Whole(buf.freeze()))
 }
 
-fn decompress(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
+/// A body in this Content-Encoding (gzip, deflate or none), decoded.
+pub fn decompress(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     match encoding {
         "gzip" | "x-gzip" => flate2::read::GzDecoder::new(data)
@@ -558,7 +560,7 @@ impl HttpProcessor for Rewriter {
     async fn response(
         &self,
         url: &str,
-        _method: &Method,
+        _request: &super::RequestHead,
         mut resp: Response<Body>,
     ) -> Response<Body> {
         self.rewrite_headers(url, true, resp.headers_mut());
@@ -617,7 +619,17 @@ impl HttpProcessor for Rewriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::Method;
+
     use crate::config::def::{BodyRewrite, HeaderRewrite, MapLocal, UrlRewrite};
+
+    fn get() -> super::super::RequestHead {
+        super::super::RequestHead {
+            method: Method::GET,
+            headers: Default::default(),
+            id: 1,
+        }
+    }
 
     fn rewriter() -> Rewriter {
         Rewriter::new(RewriteConfig {
@@ -732,7 +744,7 @@ mod tests {
                     HeaderValue::from_static("gzip"),
                 );
             }
-            let out = r.response("https://a.test/page", &Method::GET, resp).await;
+            let out = r.response("https://a.test/page", &get(), resp).await;
             assert!(out.headers().get(header::CONTENT_ENCODING).is_none());
             let text = out.into_body().collect().await.unwrap().to_bytes();
             assert_eq!(&text[..], b"{\"ad\":false,\"x\":1}");
@@ -797,7 +809,7 @@ mod tests {
                 .map(|c| Ok::<_, hyper::Error>(Frame::data(Bytes::from(c)))),
         );
         let resp = Response::new(BodyExt::boxed(StreamBody::new(chunks)));
-        let out = r.response("https://a.test/x", &Method::GET, resp).await;
+        let out = r.response("https://a.test/x", &get(), resp).await;
         assert_eq!(
             &out.into_body().collect().await.unwrap().to_bytes()[..],
             b"aaaaaaaaaaaaaaa"

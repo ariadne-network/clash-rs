@@ -712,6 +712,8 @@ async fn create_components(
         )
         .with_mitm(mitm),
     );
+    // Requests of the engine's own (scripts) go through it (our fork).
+    app::mitm::set_dispatcher(&dispatcher);
 
     let closed_flows_cap = config
         .experimental
