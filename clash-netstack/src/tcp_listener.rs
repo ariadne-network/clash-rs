@@ -20,8 +20,19 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+// Each connection has a smoltcp buffer and a ring buffer per direction,
+// their pages taken as data passes. On iOS (our fork) half the size: a
+// packet tunnel may use about 50 MiB, and an image feed keeps dozens of
+// connections busy. 128 KiB still comes from the allocator's lazily mapped
+// large blocks, so idle connections cost little.
+#[cfg(not(target_os = "ios"))]
 const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 256 * 1024; // 256 KiB
+#[cfg(not(target_os = "ios"))]
 const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 256 * 1024; // 256 KiB
+#[cfg(target_os = "ios")]
+const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 128 * 1024;
+#[cfg(target_os = "ios")]
+const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 128 * 1024;
 
 /// Time-to-live for SYN tracker entries. Duplicates within this window are
 /// suppressed to prevent the same SYN from creating multiple smoltcp sockets.
