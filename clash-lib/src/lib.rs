@@ -297,6 +297,8 @@ pub async fn start(
     }));
 
     let shared_components = Arc::new(RwLock::new(Arc::new(components)));
+    // For the cache's last save, after the reload task took its own.
+    let components_at_shutdown = shared_components.clone();
 
     let mut api_runner = Arc::new(app::api::ApiRunner::new(
         controller_cfg.clone(),
@@ -340,6 +342,11 @@ pub async fn start(
             };
 
             let new_controller_cfg = config.general.controller.clone();
+
+            // The new components read the cache file: the current fake IPs
+            // first.
+            let cache = shared_components.read().unwrap().cache_store.clone();
+            cache.save_now().await;
 
             let new_components =
                 match create_components(cwd_clone.clone(), config).await {
@@ -391,6 +398,10 @@ pub async fn start(
         result = tokio::signal::ctrl_c() => { result.map_err(Error::Io)?; }
         _ = shutdown_token.cancelled() => {}
     }
+    // An engine started next in this process reads the cache file: the fake
+    // IPs handed out since the last periodic save go in too.
+    let cache = components_at_shutdown.read().unwrap().cache_store.clone();
+    cache.save_now().await;
     Ok(())
 }
 
@@ -444,9 +455,10 @@ async fn create_components(
     let cancellation_token = tokio_util::sync::CancellationToken::new();
 
     debug!("initializing cache store");
-    let cache_store = profile::ThreadSafeCacheFile::new(
+    let cache_store = profile::ThreadSafeCacheFile::with_persistence(
         cwd.join("cache.db").as_path().to_str().unwrap(),
         config.profile.store_selected,
+        config.profile.store_selected || config.dns.store_fake_ip,
     );
 
     let system_resolver = Arc::new(

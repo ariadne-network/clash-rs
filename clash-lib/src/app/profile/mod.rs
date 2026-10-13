@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use serde::{Deserialize, Serialize};
 use tracing::{error, trace, warn};
@@ -22,44 +25,86 @@ pub struct ThreadSafeCacheFile(Arc<tokio::sync::RwLock<CacheFile>>);
 
 impl ThreadSafeCacheFile {
     pub fn new(path: &str, store_selected: bool) -> Self {
+        Self::with_persistence(path, store_selected, store_selected)
+    }
+
+    /// `persist`: save the cache to `path` (every 10 seconds when it
+    /// changed, and with `save_now` at shutdown), also when only the fake
+    /// IPs are stored: with store-fake-ip alone the file was never
+    /// written, so an engine restarted in the same process handed out the
+    /// fake IPs apps still held for other hosts.
+    pub fn with_persistence(
+        path: &str,
+        store_selected: bool,
+        persist: bool,
+    ) -> Self {
+        let persist = (persist && !path.is_empty()).then(|| {
+            Arc::new(Persist {
+                path: path.to_string(),
+                saved: Mutex::new(0),
+            })
+        });
         let store = Arc::new(tokio::sync::RwLock::new(CacheFile::new(
             path,
             store_selected,
+            persist.clone(),
         )));
 
-        let path = path.to_string();
-        let store_clone = store.clone();
-
-        if store_selected {
+        if let Some(persist) = persist {
+            let store = Arc::downgrade(&store);
             tokio::spawn(async move {
-                let store = store_clone;
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-                    let r = store.read().await;
-                    let db = r.db.clone();
-                    drop(r);
-
-                    let s = match serde_yaml::to_string(&db) {
+                    let Some(store) = store.upgrade() else { break };
+                    let snapshot = {
+                        let g = store.read().await;
+                        (g.generation > persist.saved())
+                            .then(|| (g.generation, serde_yaml::to_string(&g.db)))
+                    };
+                    drop(store);
+                    let Some((generation, text)) = snapshot else {
+                        continue;
+                    };
+                    let text = match text {
                         Ok(s) => s,
                         Err(e) => {
                             error!("failed to serialize cache file: {}", e);
                             continue;
                         }
                     };
-
-                    match tokio::fs::write(&path, s).await {
-                        Err(e) => {
-                            error!("failed to write cache file: {}", e);
-                        }
-                        _ => {
-                            trace!("cache file flushed to {}", path);
-                        }
-                    }
+                    let persist = persist.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        persist.save(generation, &text)
+                    })
+                    .await;
                 }
             });
         }
 
         Self(store)
+    }
+
+    /// Saves the changes now (persisting caches only).
+    pub async fn save_now(&self) {
+        let g = self.0.read().await;
+        let Some(persist) = g.persist.clone() else {
+            return;
+        };
+        if g.generation <= persist.saved() {
+            return;
+        }
+        let generation = g.generation;
+        let text = serde_yaml::to_string(&g.db);
+        drop(g);
+        match text {
+            Ok(text) => {
+                let _ = tokio::task::spawn_blocking(move || {
+                    persist.save(generation, &text)
+                })
+                .await;
+            }
+            Err(e) => error!("failed to serialize cache file: {}", e),
+        }
     }
 
     pub async fn set_selected(&self, group: &str, server: &str) {
@@ -132,10 +177,44 @@ struct CacheFile {
     db: Db,
 
     store_selected: bool,
+    /// Counts the changes, so only changes are saved.
+    generation: u64,
+    persist: Option<Arc<Persist>>,
+}
+
+/// Where the cache is saved, and the generation saved last: a save never
+/// replaces a newer one (the periodic save may still be writing when the
+/// one at shutdown runs).
+struct Persist {
+    path: String,
+    saved: Mutex<u64>,
+}
+
+impl Persist {
+    fn saved(&self) -> u64 {
+        *self.saved.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn save(&self, generation: u64, text: &str) {
+        let mut saved = self.saved.lock().unwrap_or_else(|e| e.into_inner());
+        if generation <= *saved {
+            return;
+        }
+        let tmp = format!("{}.tmp", self.path);
+        match std::fs::write(&tmp, text)
+            .and_then(|_| std::fs::rename(&tmp, &self.path))
+        {
+            Ok(_) => {
+                *saved = generation;
+                trace!("cache file flushed to {}", self.path);
+            }
+            Err(e) => error!("failed to write cache file: {}", e),
+        }
+    }
 }
 
 impl CacheFile {
-    pub fn new(path: &str, store_selected: bool) -> Self {
+    fn new(path: &str, store_selected: bool, persist: Option<Arc<Persist>>) -> Self {
         let db = match std::fs::read_to_string(path) {
             Ok(s) => match serde_yaml::from_str(&s) {
                 Ok(db) => db,
@@ -165,7 +244,12 @@ impl CacheFile {
             }
         };
 
-        Self { db, store_selected }
+        Self {
+            db,
+            store_selected,
+            generation: 0,
+            persist,
+        }
     }
 
     pub fn store_selected(&self) -> bool {
@@ -173,6 +257,7 @@ impl CacheFile {
     }
 
     pub fn set_selected(&mut self, group: &str, server: &str) {
+        self.generation += 1;
         self.db
             .selected
             .insert(group.to_string(), server.to_string());
@@ -183,10 +268,12 @@ impl CacheFile {
     }
 
     pub fn set_ip_to_host(&mut self, ip: &str, host: &str) {
+        self.generation += 1;
         self.db.ip_to_host.insert(ip.to_string(), host.to_string());
     }
 
     pub fn set_host_to_ip(&mut self, host: &str, ip: &str) {
+        self.generation += 1;
         self.db.host_to_ip.insert(host.to_string(), ip.to_string());
     }
 
@@ -199,11 +286,13 @@ impl CacheFile {
     }
 
     pub fn delete_fake_ip_pair(&mut self, ip: &str, host: &str) {
+        self.generation += 1;
         self.db.ip_to_host.remove(ip);
         self.db.host_to_ip.remove(host);
     }
 
     pub fn flush_fake_ip(&mut self) {
+        self.generation += 1;
         self.db.ip_to_host.clear();
         self.db.host_to_ip.clear();
     }
@@ -213,6 +302,7 @@ impl CacheFile {
         group_name: &str,
         stats: crate::proxy::group::smart::state::SmartStateData,
     ) {
+        self.generation += 1;
         self.db.smart_stats.insert(group_name.to_string(), stats);
     }
 
@@ -221,5 +311,50 @@ impl CacheFile {
         group_name: &str,
     ) -> Option<crate::proxy::group::smart::state::SmartStateData> {
         self.db.smart_stats.get(group_name).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ThreadSafeCacheFile;
+
+    #[tokio::test]
+    async fn fake_ips_alone_are_saved_and_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let path = path.to_str().unwrap();
+        {
+            let cache = ThreadSafeCacheFile::with_persistence(path, false, true);
+            cache.set_host_to_ip("example.com", "198.18.0.5").await;
+            cache.set_ip_to_host("198.18.0.5", "example.com").await;
+            // Before the periodic save: as at shutdown.
+            cache.save_now().await;
+        }
+        let again = ThreadSafeCacheFile::with_persistence(path, false, true);
+        assert_eq!(
+            again.get_fake_ip("198.18.0.5").await.as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            again.get_fake_ip("example.com").await.as_deref(),
+            Some("198.18.0.5")
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_written_without_persistence_or_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let path = path.to_str().unwrap();
+        {
+            let cache = ThreadSafeCacheFile::with_persistence(path, false, false);
+            cache.set_ip_to_host("198.18.0.5", "example.com").await;
+            cache.save_now().await;
+        }
+        assert!(!std::path::Path::new(path).exists());
+        ThreadSafeCacheFile::with_persistence(path, false, true)
+            .save_now()
+            .await;
+        assert!(!std::path::Path::new(path).exists());
     }
 }
