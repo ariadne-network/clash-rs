@@ -187,8 +187,18 @@ impl Mitm {
     pub fn handles(&self, sess: &Session) -> bool {
         sess.network == Network::Tcp
             && (self.decrypts(&sess.destination)
+                || self.decrypts_by_name(&sess.destination)
                 || self.reads_plain(&sess.destination))
             && !over_memory_ceiling()
+    }
+
+    /// A connection to an address, as from apps that resolve names
+    /// themselves (HTTPDNS): decrypted when the server name its TLS asks
+    /// for is listed.
+    fn decrypts_by_name(&self, dest: &SocksAddr) -> bool {
+        self.authority.is_some()
+            && matches!(dest, SocksAddr::Ip(_))
+            && self.hosts.has_port(dest.port())
     }
 
     fn decrypts(&self, dest: &SocksAddr) -> bool {
@@ -204,13 +214,15 @@ impl Mitm {
         self.plain_hosts.matches(&dest.host(), dest.port())
     }
 
-    /// Whether this UDP session (QUIC to a listed host) is refused, so the
-    /// client tries TCP, which is decrypted.
+    /// Whether this UDP session is refused, so the client tries TCP, where
+    /// it can be decrypted: QUIC to a listed host, or to an address (an app
+    /// that resolves names itself), whose server name QUIC does not show.
     pub fn blocks_quic(&self, sess: &Session) -> bool {
         self.quic_block
             && sess.network == Network::Udp
             && sess.destination.port() == 443
-            && self.decrypts(&sess.destination)
+            && (self.decrypts(&sess.destination)
+                || self.decrypts_by_name(&sess.destination))
     }
 
     fn listed(&self, dest: &SocksAddr) -> bool {
@@ -248,14 +260,20 @@ impl Mitm {
                 first_url(&prefix, &host)
                     .is_some_and(|url| self.processor.wants(&url))
             });
+        let decrypt = kind == Kind::Tls
+            && (self.decrypts(&sess.destination)
+                || self.decrypts_by_name(&sess.destination) && {
+                    read_record(&mut lhs, &mut prefix, deadline).await;
+                    server_name(&prefix).is_some_and(|name| {
+                        self.hosts.matches(&name, sess.destination.port())
+                    })
+                });
         let lhs = Rewind {
             prefix: prefix.into(),
             inner: lhs,
         };
         let result = match kind {
-            Kind::Tls if self.decrypts(&sess.destination) => {
-                self.serve_tls(sess, lhs, rhs).await
-            }
+            Kind::Tls if decrypt => self.serve_tls(sess, lhs, rhs).await,
             Kind::Http if plain => {
                 let site = Arc::new(Site {
                     mitm: self,
@@ -467,6 +485,77 @@ async fn sniff<S: AsyncRead + Unpin>(
             _ => return (buf, Kind::Other),
         }
     }
+}
+
+/// Reads on until `buf` holds a whole TLS record (the ClientHello).
+async fn read_record<S: AsyncRead + Unpin>(
+    s: &mut S,
+    buf: &mut Vec<u8>,
+    deadline: tokio::time::Instant,
+) {
+    loop {
+        let need = match buf.get(3..5) {
+            Some(len) => 5 + u16::from_be_bytes([len[0], len[1]]) as usize,
+            None => 5,
+        };
+        if buf.len() >= need {
+            return;
+        }
+        let mut chunk = [0u8; 2048];
+        match tokio::time::timeout_at(deadline, s.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+            _ => return,
+        }
+    }
+}
+
+/// The server name a TLS ClientHello asks for, from its first record.
+fn server_name(buf: &[u8]) -> Option<String> {
+    struct Reader<'a>(&'a [u8]);
+    impl<'a> Reader<'a> {
+        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+            let (head, rest) = (self.0.get(..n)?, self.0.get(n..)?);
+            self.0 = rest;
+            Some(head)
+        }
+        fn int(&mut self, n: usize) -> Option<usize> {
+            Some(self.take(n)?.iter().fold(0, |v, b| v << 8 | *b as usize))
+        }
+        fn vec(&mut self, len_bytes: usize) -> Option<Reader<'a>> {
+            let n = self.int(len_bytes)?;
+            self.take(n).map(Reader)
+        }
+    }
+    let mut record = Reader(buf);
+    if record.int(1)? != 0x16 {
+        return None;
+    }
+    record.take(2)?;
+    let mut handshake = record.vec(2)?;
+    if handshake.int(1)? != 1 {
+        return None;
+    }
+    let mut hello = handshake.vec(3)?;
+    hello.take(2 + 32)?; // version, random
+    hello.vec(1)?; // session id
+    hello.vec(2)?; // cipher suites
+    hello.vec(1)?; // compression methods
+    let mut extensions = hello.vec(2)?;
+    while let (Some(kind), Some(mut data)) = (extensions.int(2), extensions.vec(2)) {
+        if kind != 0 {
+            continue;
+        }
+        let mut names = data.vec(2)?;
+        while let (Some(name_type), Some(name)) = (names.int(1), names.vec(2)) {
+            if name_type == 0 {
+                return std::str::from_utf8(name.0)
+                    .ok()
+                    .map(str::to_ascii_lowercase);
+            }
+        }
+        return None;
+    }
+    None
 }
 
 /// Reads on until `buf` holds a request's head (up to 16 KiB).
@@ -794,6 +883,13 @@ impl HostList {
         self.0.iter().all(|e| e.exclude)
     }
 
+    /// Whether some host is listed on this port.
+    fn has_port(&self, port: u16) -> bool {
+        self.0
+            .iter()
+            .any(|e| !e.exclude && (e.port == 0 || e.port == port))
+    }
+
     fn matches(&self, host: &str, port: u16) -> bool {
         let host = host.to_ascii_lowercase();
         self.0
@@ -853,6 +949,60 @@ mod tests {
         assert!(list.matches("all.test", 80) && list.matches("all.test", 443));
         assert!(wildcard("a?c*", "abcdef") && !wildcard("a?c", "ac"));
         assert!(HostList::new(&["-x.test".into()], 443).is_empty());
+    }
+
+    #[test]
+    fn server_name_of_a_client_hello() {
+        crate::setup_default_crypto_provider();
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from("API.Example.com").unwrap(),
+        )
+        .unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+        assert_eq!(server_name(&hello).as_deref(), Some("api.example.com"));
+        assert_eq!(server_name(&hello[..hello.len() - 1]), None);
+        assert_eq!(server_name(b"GET / HTTP/1.1\r\n\r\n"), None);
+        let list = HostList::new(&["*.example.com".into(), "-x.test:0".into()], 443);
+        assert!(list.has_port(443) && !list.has_port(8443));
+    }
+
+    #[test]
+    fn quic_refused_to_listed_hosts_and_addresses() {
+        crate::setup_default_crypto_provider();
+        let (cert, key) = generate_ca("Test CA").unwrap();
+        let config = MitmConfig {
+            hostname: vec!["*.example.com".into()],
+            ca_cert: Some(cert),
+            ca_key: Some(key),
+            auto_quic_block: true,
+            ..Default::default()
+        };
+        let mitm = Mitm::new(Some(&config), None).unwrap().unwrap();
+        let udp = |destination: SocksAddr| Session {
+            network: Network::Udp,
+            destination,
+            ..Default::default()
+        };
+        assert!(
+            mitm.blocks_quic(&udp(SocksAddr::Domain("a.example.com".into(), 443)))
+        );
+        assert!(
+            mitm.blocks_quic(&udp("203.0.113.1:443"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into()))
+        );
+        assert!(
+            !mitm.blocks_quic(&udp(SocksAddr::Domain("other.test".into(), 443)))
+        );
+        assert!(
+            !mitm.blocks_quic(&udp(SocksAddr::Domain("a.example.com".into(), 8443)))
+        );
     }
 
     #[test]
