@@ -10,9 +10,14 @@
 //! certificate, so its hosts belong out of the list. QUIC to listed hosts
 //! is refused (`blocks_quic`), so clients fall back to TCP.
 //!
-//! With rewrites, plain HTTP passes the processor too: TCP to port 80, and
-//! to the hosts of `force-http-engine-hosts`, when the client's first bytes
-//! are an HTTP request.
+//! With rewrites, plain HTTP passes the processor too: TCP to the hosts of
+//! `force-http-engine-hosts` when the client's first bytes are an HTTP
+//! request, and to port 80 when the first request is one a rewrite takes.
+//! Anything else is relayed as it came.
+//!
+//! Above `memory_ceiling` (the iOS packet tunnel's limit is about 50 MiB),
+//! new connections are relayed as they are: decrypted ones hold two TLS
+//! sessions and HTTP buffers each.
 
 mod ca;
 mod rewrite;
@@ -20,7 +25,10 @@ mod rewrite;
 use std::{
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -39,7 +47,7 @@ use rustls::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 pub use ca::{Authority, generate_ca};
 pub use rewrite::{RewriteConfig, Rewriter};
@@ -66,6 +74,12 @@ pub enum RequestOutcome {
 /// Rewrites and scripts on decrypted HTTP. `url` is the request's full URL.
 #[async_trait]
 pub trait HttpProcessor: Send + Sync {
+    /// Whether anything applies to requests for `url`: a plain HTTP
+    /// connection is relayed as it is otherwise.
+    fn wants(&self, _url: &str) -> bool {
+        true
+    }
+
     async fn request(&self, _url: &str, req: Request<Body>) -> RequestOutcome {
         RequestOutcome::Forward(req)
     }
@@ -174,6 +188,7 @@ impl Mitm {
         sess.network == Network::Tcp
             && (self.decrypts(&sess.destination)
                 || self.reads_plain(&sess.destination))
+            && !over_memory_ceiling()
     }
 
     fn decrypts(&self, dest: &SocksAddr) -> bool {
@@ -181,9 +196,12 @@ impl Mitm {
     }
 
     fn reads_plain(&self, dest: &SocksAddr) -> bool {
-        self.rewrites
-            && (dest.port() == 80
-                || self.plain_hosts.matches(&dest.host(), dest.port()))
+        self.rewrites && (dest.port() == 80 || self.forced_plain(dest))
+    }
+
+    /// force-http-engine-hosts: read as HTTP whatever the requests are.
+    fn forced_plain(&self, dest: &SocksAddr) -> bool {
+        self.plain_hosts.matches(&dest.host(), dest.port())
     }
 
     /// Whether this UDP session (QUIC to a listed host) is refused, so the
@@ -216,17 +234,29 @@ impl Mitm {
     where
         R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (prefix, kind) = sniff(&mut lhs).await;
-        let lhs = Rewind { prefix, inner: lhs };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let (mut prefix, kind) = sniff(&mut lhs, deadline).await;
+        let host = match sess.destination.port() {
+            80 => sess.destination.host(),
+            port => format!("{}:{port}", sess.destination.host()),
+        };
+        // Port 80: only when a rewrite takes the first request.
+        let plain = kind == Kind::Http
+            && self.reads_plain(&sess.destination)
+            && (self.forced_plain(&sess.destination) || {
+                read_head(&mut lhs, &mut prefix, deadline).await;
+                first_url(&prefix, &host)
+                    .is_some_and(|url| self.processor.wants(&url))
+            });
+        let lhs = Rewind {
+            prefix: prefix.into(),
+            inner: lhs,
+        };
         let result = match kind {
             Kind::Tls if self.decrypts(&sess.destination) => {
                 self.serve_tls(sess, lhs, rhs).await
             }
-            Kind::Http if self.reads_plain(&sess.destination) => {
-                let host = match sess.destination.port() {
-                    80 => sess.destination.host(),
-                    port => format!("{}:{port}", sess.destination.host()),
-                };
+            Kind::Http if plain => {
                 let site = Arc::new(Site {
                     mitm: self,
                     scheme: "http",
@@ -366,7 +396,8 @@ where
         .map_err(io::Error::other)
 }
 
-/// A request dropped unanswered (`RequestOutcome::Drop`).
+/// A request left unanswered: a rule dropped it (`RequestOutcome::Drop`),
+/// or the server's connection broke.
 #[derive(Debug)]
 struct Dropped;
 
@@ -412,9 +443,11 @@ const METHODS: &[&[u8]] = &[
 
 /// Reads the client's first bytes: a TLS handshake, an HTTP request, or
 /// something else (also when the client waits for the server to speak).
-async fn sniff<S: AsyncRead + Unpin>(s: &mut S) -> (Bytes, Kind) {
+async fn sniff<S: AsyncRead + Unpin>(
+    s: &mut S,
+    deadline: tokio::time::Instant,
+) -> (Vec<u8>, Kind) {
     let mut buf = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
         let kind = if buf.first() == Some(&0x16) {
             Some(Kind::Tls)
@@ -426,14 +459,122 @@ async fn sniff<S: AsyncRead + Unpin>(s: &mut S) -> (Bytes, Kind) {
             None
         };
         if let Some(kind) = kind {
-            return (buf.into(), kind);
+            return (buf, kind);
         }
         let mut chunk = [0u8; 2048];
         match tokio::time::timeout_at(deadline, s.read(&mut chunk)).await {
             Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
-            _ => return (buf.into(), Kind::Other),
+            _ => return (buf, Kind::Other),
         }
     }
+}
+
+/// Reads on until `buf` holds a request's head (up to 16 KiB).
+async fn read_head<S: AsyncRead + Unpin>(
+    s: &mut S,
+    buf: &mut Vec<u8>,
+    deadline: tokio::time::Instant,
+) {
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 16 * 1024 {
+        let mut chunk = [0u8; 2048];
+        match tokio::time::timeout_at(deadline, s.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+            _ => return,
+        }
+    }
+}
+
+/// The URL of the request whose head starts `buf`, as `Site::url` makes
+/// it.
+fn first_url(buf: &[u8], fallback_host: &str) -> Option<String> {
+    let end = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&buf[..end]).ok()?;
+    let mut lines = head.split("\r\n");
+    let target = lines.next()?.split(' ').nth(1)?;
+    if target.starts_with("http://") {
+        return Some(target.to_owned());
+    }
+    let host = lines
+        .filter_map(|l| l.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("host"))
+        .map_or(fallback_host, |(_, value)| value.trim());
+    Some(format!("http://{}{target}", host.to_ascii_lowercase()))
+}
+
+/// The footprint above which new connections are relayed as they are
+/// (bytes; 0: none). On iOS, where the packet tunnel may use about 50 MiB,
+/// 36 MiB by default.
+static MEMORY_CEILING: AtomicU64 =
+    AtomicU64::new(if cfg!(target_os = "ios") { 36 << 20 } else { 0 });
+static OVER_CEILING: AtomicBool = AtomicBool::new(false);
+
+pub fn set_memory_ceiling(bytes: u64) {
+    MEMORY_CEILING.store(bytes, Ordering::Relaxed);
+}
+
+/// Whether the process is above the ceiling; says so when that changes.
+fn over_memory_ceiling() -> bool {
+    let ceiling = MEMORY_CEILING.load(Ordering::Relaxed);
+    if ceiling == 0 {
+        return false;
+    }
+    let Some(footprint) = footprint() else {
+        return false;
+    };
+    let over = footprint > ceiling;
+    if OVER_CEILING.swap(over, Ordering::Relaxed) != over {
+        let mib = |b: u64| b >> 20;
+        if over {
+            warn!(
+                "memory {} MiB, above {} MiB: new connections are relayed \
+                 without decryption or rewrites",
+                mib(footprint),
+                mib(ceiling)
+            );
+        } else {
+            info!("memory {} MiB: decrypting again", mib(footprint));
+        }
+    }
+    over
+}
+
+/// What the system counts against the process's memory limit (task_info
+/// TASK_VM_INFO, `phys_footprint`).
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+fn footprint() -> Option<u64> {
+    // struct task_vm_info up to phys_footprint (rev1).
+    #[repr(C)]
+    #[derive(Default)]
+    struct TaskVmInfo {
+        virtual_size: u64,
+        region_count: i32,
+        page_size: i32,
+        /// resident_size … compressed_lifetime
+        sizes: [u64; 16],
+        phys_footprint: u64,
+    }
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn task_info(task: u32, flavor: u32, info: *mut i32, count: *mut u32)
+        -> i32;
+    }
+    const TASK_VM_INFO: u32 = 22;
+    let mut info = TaskVmInfo::default();
+    let mut count = (std::mem::size_of::<TaskVmInfo>() / 4) as u32;
+    let result = unsafe {
+        task_info(
+            mach_task_self_,
+            TASK_VM_INFO,
+            (&mut info as *mut TaskVmInfo).cast(),
+            &mut count,
+        )
+    };
+    (result == 0).then_some(info.phys_footprint)
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+fn footprint() -> Option<u64> {
+    None
 }
 
 /// A stream with the bytes already read from it put back in front.
@@ -557,10 +698,10 @@ impl Site {
         let mut resp = match upstream.send(req).await {
             Ok(resp) => resp,
             Err(e) => {
-                warn!("MITM {url}: {e}");
-                let mut resp = Response::new(full_body(format!("Bad gateway: {e}")));
-                *resp.status_mut() = StatusCode::BAD_GATEWAY;
-                return Ok(resp);
+                // The server's connection broke: the client's closes too
+                // (HTTP/2: the stream), and the client tries again.
+                debug!("MITM {}: server: {e}", self.host);
+                return Err(Dropped);
             }
         };
         // WebSocket and other upgrades: the two sides joined as they are.
@@ -714,6 +855,94 @@ mod tests {
         assert!(HostList::new(&["-x.test".into()], 443).is_empty());
     }
 
+    #[test]
+    fn first_request_url_and_footprint() {
+        let head = b"GET /a?b HTTP/1.1\r\nHOST: Ex.Test\r\nX: y\r\n\r\nbody";
+        assert_eq!(
+            first_url(head, "1.2.3.4").as_deref(),
+            Some("http://ex.test/a?b")
+        );
+        let no_host = b"GET / HTTP/1.0\r\n\r\n";
+        assert_eq!(
+            first_url(no_host, "1.2.3.4").as_deref(),
+            Some("http://1.2.3.4/")
+        );
+        let absolute = b"GET http://a.test/x HTTP/1.1\r\n\r\n";
+        assert_eq!(first_url(absolute, "b").as_deref(), Some("http://a.test/x"));
+        assert_eq!(first_url(b"GET / HTTP/1.1\r\nHost: a", "b"), None);
+        #[cfg(target_os = "macos")]
+        {
+            let bytes = footprint().unwrap();
+            assert!(bytes > 1 << 20 && bytes < 1 << 34, "{bytes}");
+            set_memory_ceiling(1 << 20);
+            assert!(over_memory_ceiling());
+            set_memory_ceiling(0);
+            assert!(!over_memory_ceiling());
+        }
+    }
+
+    #[tokio::test]
+    async fn port_80_is_read_only_for_a_rewrite() {
+        use tokio::io::AsyncWriteExt;
+
+        use crate::config::def::UrlRewrite;
+        let rewrite = RewriteConfig {
+            url: vec![UrlRewrite {
+                pattern: r"^http://a\.test/taken".into(),
+                kind: "reject-dict".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mitm = Mitm::new(None, Some(&rewrite)).unwrap().unwrap();
+        let sess = Session {
+            network: Network::Tcp,
+            destination: SocksAddr::Domain("a.test".into(), 80),
+            ..Default::default()
+        };
+        assert!(mitm.handles(&sess));
+        for (path, answered) in [("/taken", true), ("/other", false)] {
+            let (client, engine_side) = tokio::io::duplex(4096);
+            let (_server, upstream) = tokio::io::duplex(4096);
+            let request =
+                format!("GET {path} HTTP/1.1\r\nHost: A.test\r\nX-Case: 1\r\n\r\n");
+            let mut client = client;
+            client.write_all(request.as_bytes()).await.unwrap();
+            let lhs: Box<dyn ProxyStream> = Box::new(Rewind {
+                prefix: Bytes::new(),
+                inner: engine_side,
+            });
+            let serving = tokio::spawn({
+                let (mitm, sess) = (mitm.clone(), sess.clone());
+                async move { mitm.serve(&sess, lhs, upstream).await.map(|(l, _)| l) }
+            });
+            if answered {
+                // The rewrite's answer, and the connection served here.
+                let mut reply = vec![0u8; 512];
+                let n = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    client.read(&mut reply),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let reply = String::from_utf8_lossy(&reply[..n]).into_owned();
+                assert!(
+                    reply.starts_with("HTTP/1.1 200") && reply.ends_with("{}"),
+                    "{reply}"
+                );
+                drop(client);
+                assert!(serving.await.unwrap().is_none());
+            } else {
+                // Handed back for relaying, with the request as it came.
+                let mut lhs = serving.await.unwrap().expect("relayed");
+                let mut back = vec![0u8; request.len()];
+                lhs.read_exact(&mut back).await.unwrap();
+                assert_eq!(back, request.as_bytes());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn sniffed_bytes_are_put_back() {
         use tokio::io::AsyncWriteExt;
@@ -728,13 +957,17 @@ mod tests {
             let (mut a, mut b) = tokio::io::duplex(64);
             b.write_all(input).await.unwrap();
             drop(b);
-            let (prefix, k) = sniff(&mut a).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let (prefix, k) = sniff(&mut a, deadline).await;
             assert_eq!(k, kind, "{input:?}");
             let mut out = Vec::new();
-            Rewind { prefix, inner: a }
-                .read_to_end(&mut out)
-                .await
-                .unwrap();
+            Rewind {
+                prefix: prefix.into(),
+                inner: a,
+            }
+            .read_to_end(&mut out)
+            .await
+            .unwrap();
             assert_eq!(out, input);
         }
     }

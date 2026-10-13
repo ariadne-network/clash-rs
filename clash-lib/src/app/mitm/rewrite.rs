@@ -432,6 +432,12 @@ fn gzip(data: &[u8]) -> Vec<u8> {
 
 #[async_trait]
 impl HttpProcessor for Rewriter {
+    fn wants(&self, url: &str) -> bool {
+        [&self.url, &self.map_local, &self.header, &self.body]
+            .iter()
+            .any(|p| p.first(url).is_some())
+    }
+
     async fn request(&self, url: &str, mut req: Request<Body>) -> RequestOutcome {
         self.rewrite_headers(url, false, req.headers_mut());
 
