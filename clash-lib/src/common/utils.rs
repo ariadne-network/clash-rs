@@ -191,3 +191,42 @@ where
 
     Ok(())
 }
+
+/// What the system counts against the process's memory limit (task_info
+/// TASK_VM_INFO, `phys_footprint`).
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+pub fn memory_footprint() -> Option<u64> {
+    // struct task_vm_info up to phys_footprint (rev1).
+    #[repr(C)]
+    #[derive(Default)]
+    struct TaskVmInfo {
+        virtual_size: u64,
+        region_count: i32,
+        page_size: i32,
+        /// resident_size … compressed_lifetime
+        sizes: [u64; 16],
+        phys_footprint: u64,
+    }
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn task_info(task: u32, flavor: u32, info: *mut i32, count: *mut u32)
+        -> i32;
+    }
+    const TASK_VM_INFO: u32 = 22;
+    let mut info = TaskVmInfo::default();
+    let mut count = (std::mem::size_of::<TaskVmInfo>() / 4) as u32;
+    let result = unsafe {
+        task_info(
+            mach_task_self_,
+            TASK_VM_INFO,
+            (&mut info as *mut TaskVmInfo).cast(),
+            &mut count,
+        )
+    };
+    (result == 0).then_some(info.phys_footprint)
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+pub fn memory_footprint() -> Option<u64> {
+    None
+}

@@ -855,6 +855,13 @@ pub struct Experimental {
     /// and the proxy reaching the test site do not count.
     #[serde(default)]
     pub unified_delay: bool,
+    /// Past this many MiB (on Apple systems the footprint), new
+    /// connections are refused and caches cleared; past
+    /// `memory-hard-ratio` times it (default 2), the idlest fifth of the
+    /// connections close, checked every second (our fork; as
+    /// CLASH_RS_MEM_LIMIT_MB with `:hard`).
+    pub memory_limit_mb: Option<u64>,
+    pub memory_hard_ratio: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize)]

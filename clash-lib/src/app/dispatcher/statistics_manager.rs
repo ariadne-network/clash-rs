@@ -335,6 +335,13 @@ impl Manager {
         *m = mode;
     }
 
+    /// Hard mode closes connections above this multiple of the limit
+    /// (x100; at least 100).
+    pub fn set_memory_hard_ratio(&self, ratio_x100: u64) {
+        self.mem_hard_ratio_x100
+            .store(ratio_x100.max(100), Ordering::Relaxed);
+    }
+
     /// Returns the configured memory limit in bytes (0 = unlimited).
     pub fn memory_limit(&self) -> u64 {
         self.mem_limit_bytes.load(Ordering::Relaxed)
@@ -570,8 +577,13 @@ impl Manager {
         self.download_total.store(0, Ordering::Relaxed);
     }
 
+    /// On Apple systems the footprint, which their memory limits count
+    /// (our fork); else the resident size.
     pub fn memory_usage(&self) -> usize {
-        memory_stats().map(|x| x.physical_mem).unwrap_or(0)
+        crate::common::utils::memory_footprint()
+            .map(|b| b as usize)
+            .or_else(|| memory_stats().map(|x| x.physical_mem))
+            .unwrap_or(0)
     }
 
     /// Test helper: directly populate `user_period_stats` to simulate closed
@@ -597,10 +609,7 @@ impl Manager {
     }
 
     async fn kick_off(&self) {
-        // Memory check runs every 5 seconds (not every 1s) to reduce CPU load.
-        // Traffic blip still updates every 1s.
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-        let mut mem_check_counter: u32 = 0;
         while self.running.load(Ordering::Relaxed) {
             ticker.tick().await;
             self.upload_blip
@@ -612,12 +621,11 @@ impl Manager {
             );
             self.download_temp.store(0, Ordering::Relaxed);
 
-            // Memory pressure check every 5 seconds
-            mem_check_counter += 1;
-            if mem_check_counter >= 5 {
-                mem_check_counter = 0;
-                self.check_memory_pressure().await;
-            }
+            // Memory pressure check every second (our fork; every 5 seconds
+            // upstream): an iOS packet tunnel can gain several MiB in a
+            // few seconds, and iOS ends it at its limit. Without a limit
+            // the check returns at once.
+            self.check_memory_pressure().await;
         }
     }
 

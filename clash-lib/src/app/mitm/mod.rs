@@ -53,7 +53,10 @@ pub use ca::{Authority, generate_ca};
 pub use rewrite::{RewriteConfig, Rewriter};
 
 use crate::{
-    common::tls::{DefaultTlsVerifier, GLOBAL_ROOT_STORE},
+    common::{
+        tls::{DefaultTlsVerifier, GLOBAL_ROOT_STORE},
+        utils::memory_footprint,
+    },
     config::def::MitmConfig,
     proxy::ProxyStream,
     session::{Network, Session, SocksAddr},
@@ -607,7 +610,7 @@ fn over_memory_ceiling() -> bool {
     if ceiling == 0 {
         return false;
     }
-    let Some(footprint) = footprint() else {
+    let Some(footprint) = memory_footprint() else {
         return false;
     };
     let over = footprint > ceiling;
@@ -625,45 +628,6 @@ fn over_memory_ceiling() -> bool {
         }
     }
     over
-}
-
-/// What the system counts against the process's memory limit (task_info
-/// TASK_VM_INFO, `phys_footprint`).
-#[cfg(any(target_os = "ios", target_os = "macos"))]
-fn footprint() -> Option<u64> {
-    // struct task_vm_info up to phys_footprint (rev1).
-    #[repr(C)]
-    #[derive(Default)]
-    struct TaskVmInfo {
-        virtual_size: u64,
-        region_count: i32,
-        page_size: i32,
-        /// resident_size … compressed_lifetime
-        sizes: [u64; 16],
-        phys_footprint: u64,
-    }
-    unsafe extern "C" {
-        static mach_task_self_: u32;
-        fn task_info(task: u32, flavor: u32, info: *mut i32, count: *mut u32)
-        -> i32;
-    }
-    const TASK_VM_INFO: u32 = 22;
-    let mut info = TaskVmInfo::default();
-    let mut count = (std::mem::size_of::<TaskVmInfo>() / 4) as u32;
-    let result = unsafe {
-        task_info(
-            mach_task_self_,
-            TASK_VM_INFO,
-            (&mut info as *mut TaskVmInfo).cast(),
-            &mut count,
-        )
-    };
-    (result == 0).then_some(info.phys_footprint)
-}
-
-#[cfg(not(any(target_os = "ios", target_os = "macos")))]
-fn footprint() -> Option<u64> {
-    None
 }
 
 /// A stream with the bytes already read from it put back in front.
@@ -1022,7 +986,7 @@ mod tests {
         assert_eq!(first_url(b"GET / HTTP/1.1\r\nHost: a", "b"), None);
         #[cfg(target_os = "macos")]
         {
-            let bytes = footprint().unwrap();
+            let bytes = memory_footprint().unwrap();
             assert!(bytes > 1 << 20 && bytes < 1 << 34, "{bytes}");
             set_memory_ceiling(1 << 20);
             assert!(over_memory_ceiling());

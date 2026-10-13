@@ -669,6 +669,25 @@ async fn create_components(
     }
 
     let statistics_manager = StatisticsManager::new();
+    // A memory limit from the configuration (our fork).
+    if let Some(mb) = config
+        .experimental
+        .as_ref()
+        .and_then(|e| e.memory_limit_mb)
+        .filter(|mb| *mb > 0)
+    {
+        statistics_manager
+            .set_memory_limit(mb << 20, app::dispatcher::MemLimitMode::Hard)
+            .await;
+        if let Some(ratio) = config
+            .experimental
+            .as_ref()
+            .and_then(|e| e.memory_hard_ratio)
+            .filter(|r| r.is_finite())
+        {
+            statistics_manager.set_memory_hard_ratio((ratio * 100.0).round() as u64);
+        }
+    }
 
     // Inject the DNS resolver so statistics_manager can clear DNS caches
     // under memory pressure (see check_memory_pressure).
