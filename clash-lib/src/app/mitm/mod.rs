@@ -586,20 +586,19 @@ impl Site {
     /// The full URL: HTTP/2 requests carry it, HTTP/1.1 ones the path and
     /// a Host header.
     fn url<B>(&self, req: &Request<B>) -> String {
-        if req.uri().scheme().is_some() {
-            return req.uri().to_string();
-        }
-        let host = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or(&self.host);
-        let path = req
-            .uri()
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/");
-        format!("{}://{host}{path}", self.scheme)
+        let uri = req.uri();
+        let host = match uri.authority() {
+            Some(authority) => authority.as_str(),
+            None => req
+                .headers()
+                .get(header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or(&self.host),
+        };
+        let scheme = uri.scheme_str().unwrap_or(self.scheme);
+        let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        // The host in lower case, as browsers write URLs.
+        format!("{scheme}://{}{path}", host.to_ascii_lowercase())
     }
 }
 

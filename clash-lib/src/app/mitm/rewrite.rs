@@ -6,7 +6,7 @@
 //! `regex` crate takes go into sets, matched at once (a module may have
 //! hundreds), the rest (look-around) one by one.
 
-use std::io::Read;
+use std::{collections::HashMap, io::Read, sync::OnceLock};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -17,7 +17,6 @@ use http::{
 };
 use http_body_util::{BodyExt, BodyStream, StreamBody};
 use hyper::body::Frame;
-use regex::RegexSet;
 use tracing::{debug, warn};
 
 use super::{Body, HttpProcessor, RequestOutcome, full_body};
@@ -25,92 +24,189 @@ pub use crate::config::def::RewriteConfig;
 
 const DEFAULT_MAX_BODY: usize = 1 << 20;
 
-/// Patterns matched at once where the `regex` crate takes them.
+/// A rule list's patterns. Most of a module's patterns name one host
+/// (`^https?:\/\/api\.example\.com\/...`): they are looked up by the URL's
+/// host, and only the others are tried on every URL. Each is compiled on
+/// first use: as bytes with ASCII classes and case folding where the
+/// `regex` crate takes it (URLs are ASCII; the Unicode tables would cost
+/// much memory for hundreds of case-insensitive patterns), else (look-
+/// around) with fancy-regex.
 struct Patterns {
-    set: RegexSet,
-    /// The indexes `set` holds, in order.
-    in_set: Vec<usize>,
-    /// The others (look-around), by index.
-    fancy: Vec<(usize, fancy_regex::Regex)>,
-    /// Every pattern compiled for replacement (None: fancy only).
-    each: Vec<Option<regex::Regex>>,
-    fancy_each: Vec<Option<fancy_regex::Regex>>,
+    sources: Vec<String>,
+    compiled: Vec<OnceLock<Compiled>>,
+    by_host: HashMap<String, Vec<usize>>,
+    /// The patterns not bound to a host, in order.
+    unbound: Vec<usize>,
+}
+
+enum Compiled {
+    Ascii(regex::bytes::Regex),
+    Fancy(fancy_regex::Regex),
+    Invalid,
+}
+
+impl Compiled {
+    fn new(p: &str) -> Self {
+        // URLs are short: a small lazy-DFA cache (2 MB by default, per
+        // thread) does.
+        if let Ok(re) = regex::bytes::RegexBuilder::new(p)
+            .unicode(false)
+            .dfa_size_limit(1 << 17)
+            .build()
+        {
+            return Compiled::Ascii(re);
+        }
+        match fancy_regex::RegexBuilder::new(p)
+            .backtrack_limit(100_000)
+            .build()
+        {
+            Ok(re) => Compiled::Fancy(re),
+            Err(e) => {
+                warn!("rewrite: invalid pattern {p:?}: {e}");
+                Compiled::Invalid
+            }
+        }
+    }
+
+    fn is_match(&self, text: &str) -> bool {
+        match self {
+            Compiled::Ascii(re) => re.is_match(text.as_bytes()),
+            Compiled::Fancy(re) => re.is_match(text).unwrap_or(false),
+            Compiled::Invalid => false,
+        }
+    }
 }
 
 impl Patterns {
     fn new<'a>(patterns: impl Iterator<Item = &'a str>) -> Self {
-        let mut in_set = Vec::new();
-        let mut set_patterns = Vec::new();
-        let mut fancy = Vec::new();
-        let mut each = Vec::new();
-        let mut fancy_each = Vec::new();
+        let mut sources = Vec::new();
+        let mut by_host: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut unbound = Vec::new();
         for (i, p) in patterns.enumerate() {
-            match regex::Regex::new(p) {
-                Ok(re) => {
-                    in_set.push(i);
-                    set_patterns.push(p.to_owned());
-                    each.push(Some(re));
-                    fancy_each.push(None);
-                }
-                Err(_) => match fancy_regex::RegexBuilder::new(p)
-                    .backtrack_limit(100_000)
-                    .build()
-                {
-                    Ok(re) => {
-                        fancy.push((i, re.clone()));
-                        each.push(None);
-                        fancy_each.push(Some(re));
-                    }
-                    Err(e) => {
-                        warn!("rewrite: invalid pattern {p:?}: {e}");
-                        each.push(None);
-                        fancy_each.push(None);
-                    }
-                },
+            match bound_host(p) {
+                Some(host) => by_host.entry(host).or_default().push(i),
+                None => unbound.push(i),
             }
+            sources.push(p.to_owned());
         }
-        let set = RegexSet::new(&set_patterns).unwrap_or_else(|_| RegexSet::empty());
+        let compiled = sources.iter().map(|_| OnceLock::new()).collect();
         Self {
-            set,
-            in_set,
-            fancy,
-            each,
-            fancy_each,
+            sources,
+            compiled,
+            by_host,
+            unbound,
         }
     }
 
-    /// The indexes matching `text`, in order.
-    fn matching(&self, text: &str) -> Vec<usize> {
-        let mut out: Vec<usize> = self
-            .set
-            .matches(text)
-            .iter()
-            .map(|i| self.in_set[i])
-            .collect();
-        out.extend(
-            self.fancy
-                .iter()
-                .filter(|(_, re)| re.is_match(text).unwrap_or(false))
-                .map(|(i, _)| *i),
-        );
-        out.sort_unstable();
+    fn compiled(&self, i: usize) -> &Compiled {
+        self.compiled[i].get_or_init(|| Compiled::new(&self.sources[i]))
+    }
+
+    /// The patterns that may match `url`, in order.
+    fn candidates(&self, url: &str) -> Vec<usize> {
+        let mut out = self.unbound.clone();
+        if let Some(bound) = self.by_host.get(&url_host(url)) {
+            out.extend(bound);
+            out.sort_unstable();
+        }
         out
     }
 
-    fn first(&self, text: &str) -> Option<usize> {
-        self.matching(text).into_iter().next()
+    /// The indexes matching `url`, in order.
+    fn matching(&self, url: &str) -> Vec<usize> {
+        self.candidates(url)
+            .into_iter()
+            .filter(|i| self.compiled(*i).is_match(url))
+            .collect()
+    }
+
+    fn first(&self, url: &str) -> Option<usize> {
+        self.candidates(url)
+            .into_iter()
+            .find(|i| self.compiled(*i).is_match(url))
     }
 
     /// `text` with pattern i's match replaced ($1 and the like).
     fn replace(&self, i: usize, text: &str, template: &str) -> String {
-        if let Some(Some(re)) = self.each.get(i) {
-            return re.replace(text, template).into_owned();
+        match self.compiled(i) {
+            Compiled::Ascii(re) => String::from_utf8_lossy(
+                &re.replace(text.as_bytes(), template.as_bytes()),
+            )
+            .into_owned(),
+            Compiled::Fancy(re) => re.replace(text, template).into_owned(),
+            Compiled::Invalid => template.to_owned(),
         }
-        if let Some(Some(re)) = self.fancy_each.get(i) {
-            return re.replace(text, template).into_owned();
-        }
-        template.to_owned()
     }
+}
+
+/// The URL's host, lower case.
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let end = rest.find(['/', '?', '#', ':']).unwrap_or(rest.len());
+    rest[..end].to_ascii_lowercase()
+}
+
+/// The host a pattern can only match URLs of: one anchored at a scheme and
+/// a literal host, followed by the path, port, query or `$`
+/// (`^https?:\/\/api\.example\.com\/`), with no alternative at its top
+/// level. An unescaped dot in the host is taken for a dot.
+fn bound_host(p: &str) -> Option<String> {
+    if top_level_alternation(p) {
+        return None;
+    }
+    let q = p.strip_prefix("(?i)").unwrap_or(p).strip_prefix('^')?;
+    let q = ["http(s)?", "http[s]?", "https?", "https", "http"]
+        .iter()
+        .find_map(|s| q.strip_prefix(s))?;
+    let q = q.strip_prefix(r":\/\/").or_else(|| q.strip_prefix("://"))?;
+    let chars: Vec<char> = q.chars().collect();
+    let mut host = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = if c == '\\' && matches!(chars.get(i + 1), Some('.' | '-')) {
+            i += 2;
+            chars[i - 1]
+        } else if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+            i += 1;
+            c
+        } else {
+            break;
+        };
+        // A quantified character: not one host.
+        if matches!(chars.get(i), Some('?' | '*' | '+' | '{')) {
+            return None;
+        }
+        host.push(next.to_ascii_lowercase());
+    }
+    // Where the host ends (a pattern that stops inside it matches longer
+    // hosts too).
+    let rest: String = chars[i..].iter().collect();
+    let ends = [r"\/", "/", ":", "$", r"\?"]
+        .iter()
+        .any(|e| rest.starts_with(e));
+    (!host.is_empty() && ends).then_some(host)
+}
+
+/// Whether a `|` stands outside every group and class.
+fn top_level_alternation(p: &str) -> bool {
+    let mut depth = 0i32;
+    let mut class = false;
+    let mut chars = p.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '[' if !class => class = true,
+            ']' if class => class = false,
+            '(' if !class => depth += 1,
+            ')' if !class => depth -= 1,
+            '|' if !class && depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 pub struct Rewriter {
@@ -432,7 +528,9 @@ impl HttpProcessor for Rewriter {
             let bytes = match collect(body, self.max_body).await {
                 Ok(Collected::Whole(bytes)) => bytes,
                 Ok(Collected::TooLarge(body)) => {
-                    return RequestOutcome::Forward(Request::from_parts(parts, body));
+                    return RequestOutcome::Forward(Request::from_parts(
+                        parts, body,
+                    ));
                 }
                 Err(e) => {
                     debug!("rewrite {url}: request body: {e}");
@@ -633,6 +731,47 @@ mod tests {
             let text = out.into_body().collect().await.unwrap().to_bytes();
             assert_eq!(&text[..], b"{\"ad\":false,\"x\":1}");
         }
+    }
+
+    #[test]
+    fn patterns_bound_to_a_host() {
+        assert_eq!(
+            bound_host(r"^https?:\/\/api\.example\.com\/ad"),
+            Some("api.example.com".into())
+        );
+        assert_eq!(
+            bound_host(r"(?i)^https://A.example.com:8443/"),
+            Some("a.example.com".into())
+        );
+        assert_eq!(
+            bound_host(r"^http(s)?://x-y.test$"),
+            Some("x-y.test".into())
+        );
+        for unbound in [
+            r"(?i)\b\/ad\/",
+            r"^https?:\/\/ads?\.example\.com\/",
+            r"^https?:\/\/(www\.)?example\.com\/",
+            r"^https?:\/\/.*\.example\.com\/",
+            r"^https?:\/\/a\.com\/x|^https?:\/\/b\.com\/",
+            r"^https?:\/\/a\.com(\/|$)",
+            r"^https?:\/\/api\.example\.co",
+        ] {
+            assert_eq!(bound_host(unbound), None, "{unbound}");
+        }
+        assert!(!top_level_alternation(r"^https?:\/\/a\.com\/(x|y)[|]\|"));
+        // Looked up by host; the others on every URL, in order.
+        let p = Patterns::new(
+            [
+                r"(?i)\/ad\/",
+                r"^https?:\/\/a\.test\/x",
+                r"^https?:\/\/b\.test\/",
+            ]
+            .into_iter(),
+        );
+        assert_eq!(p.matching("https://a.test/x/ad/"), [0, 1]);
+        assert_eq!(p.first("https://A.test:8443/x"), None);
+        assert_eq!(p.first("http://a.test/x?q"), Some(1));
+        assert_eq!(p.replace(1, "http://a.test/x1", "$0!"), "http://a.test/x!1");
     }
 
     #[tokio::test]
