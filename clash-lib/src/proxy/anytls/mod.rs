@@ -238,6 +238,16 @@ impl Handler {
                             cancel_a.cancel();
                             break;
                         }
+                        // Out now: a transport underneath may hold writes
+                        // until flushed (WebSocket queues a frame per write),
+                        // as when this node is reached through a VLESS or
+                        // VMess WebSocket relay; the data would wait for the
+                        // next write.
+                        if let Err(err) = remote_write.flush().await {
+                            debug!("anytls {} flush PSH failed: {}", name_a, err);
+                            cancel_a.cancel();
+                            break;
+                        }
                     }
                 }
             }
