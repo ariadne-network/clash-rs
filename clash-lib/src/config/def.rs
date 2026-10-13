@@ -479,6 +479,8 @@ pub struct Config {
 
     /// HTTPS decryption (our fork, app::mitm)
     pub mitm: Option<MitmConfig>,
+    /// Rewrites on decrypted and plain HTTP (our fork, app::mitm::rewrite)
+    pub http_rewrite: Option<RewriteConfig>,
 
     /// tun settings
     /// # Example
@@ -760,6 +762,78 @@ pub struct MitmConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// Rewrites on decrypted and plain HTTP (our fork, app::mitm::rewrite),
+/// as Surge has them. Patterns are regular expressions on the full URL.
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct RewriteConfig {
+    pub url: Vec<UrlRewrite>,
+    pub map_local: Vec<MapLocal>,
+    pub header: Vec<HeaderRewrite>,
+    pub body: Vec<BodyRewrite>,
+    /// Bodies rewritten up to this size (default 1 MB); larger ones pass
+    /// unchanged.
+    pub max_body_size: Option<usize>,
+    /// TCP that is read as HTTP besides port 80 (Surge's
+    /// force-http-engine-hosts; a bare name is port 80).
+    pub force_http_engine_hosts: Vec<String>,
+}
+
+impl RewriteConfig {
+    pub fn is_empty(&self) -> bool {
+        self.url.is_empty()
+            && self.map_local.is_empty()
+            && self.header.is_empty()
+            && self.body.is_empty()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct UrlRewrite {
+    pub pattern: String,
+    pub replacement: String,
+    /// header, 302, 307, reject, reject-200, reject-img, reject-dict,
+    /// reject-array, reject-drop.
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct MapLocal {
+    pub pattern: String,
+    pub status_code: Option<u16>,
+    pub headers: Vec<(String, String)>,
+    /// The body, base64.
+    pub body: String,
+    pub content_type: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct HeaderRewrite {
+    /// On responses; else on requests.
+    pub response: bool,
+    pub pattern: String,
+    /// add, del, replace, replace-regex.
+    pub action: String,
+    pub name: String,
+    /// The value; for replace-regex, the regular expression.
+    pub value: String,
+    /// replace-regex: what matches of `value` become.
+    pub replacement: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct BodyRewrite {
+    pub response: bool,
+    pub pattern: String,
+    /// Regular expression and replacement, in turn.
+    pub pairs: Vec<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize, Default)]

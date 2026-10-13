@@ -33,6 +33,7 @@ pub struct Config {
     pub tun: TunConfig,
     pub experimental: Option<def::Experimental>,
     pub mitm: Option<def::MitmConfig>,
+    pub http_rewrite: Option<def::RewriteConfig>,
     pub profile: Profile,
     pub rules: Vec<RuleType>,
     pub rule_providers: HashMap<String, RuleProviderDef>,

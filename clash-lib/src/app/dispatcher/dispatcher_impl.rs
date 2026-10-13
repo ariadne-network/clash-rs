@@ -71,7 +71,7 @@ impl Dispatcher {
         }
     }
 
-    /// Decrypts the hosts `mitm` lists (our fork).
+    /// Decrypts the hosts `mitm` lists and rewrites HTTP (our fork).
     pub fn with_mitm(mut self, mitm: Option<Arc<crate::app::mitm::Mitm>>) -> Self {
         self.mitm = mitm;
         self
@@ -147,11 +147,14 @@ impl Dispatcher {
                     rule.map(|r| r.matcher()),
                 )
                 .await;
-                if let Some(mitm) = self.mitm.as_ref().filter(|m| m.decrypts(&sess)) {
-                    if let Err(e) = mitm.clone().serve(&sess, lhs, rhs).await {
-                        warn!("MITM {}: {}", sess, e);
+                // HTTPS decryption and rewrites (our fork); what they
+                // leave is relayed as usual.
+                let mitm = self.mitm.clone().filter(|m| m.handles(&sess));
+                if let Some(mitm) = mitm {
+                    match mitm.serve(&sess, lhs, rhs).await {
+                        Some((l, r)) => (lhs, rhs) = (l, r),
+                        None => return,
                     }
-                    return;
                 }
                 match copy_bidirectional(
                     lhs,

@@ -75,7 +75,9 @@ impl Authority {
         params.subject_alt_names = vec![match host.parse::<IpAddr>() {
             Ok(ip) => SanType::IpAddress(ip),
             Err(_) => SanType::DnsName(
-                host.to_owned().try_into().map_err(|e| format!("{host}: {e}"))?,
+                host.to_owned()
+                    .try_into()
+                    .map_err(|e| format!("{host}: {e}"))?,
             ),
         }];
         let mut dn = DistinguishedName::new();

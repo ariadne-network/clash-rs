@@ -100,6 +100,8 @@ url = "2"
 bytes = "1"
 ipnet = "2"
 regex = "1"
+# Rewrites with look-around (app::mitm::rewrite, our fork).
+fancy-regex = "0.14"
 byteorder = "1"
 lru_time_cache = "0.11"
 uuid = { version = "1", features = ["v4", "v5", "fast-rng", "macro-diagnostics", "serde"] }

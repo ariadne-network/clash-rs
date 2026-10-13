@@ -677,12 +677,11 @@ async fn create_components(
         .await;
 
     debug!("initializing dispatcher");
-    // HTTPS decryption (our fork): without a CA or hosts, none.
-    let mitm = match config.mitm.as_ref() {
-        Some(m) => app::mitm::Mitm::new(m, Arc::new(app::mitm::Passthrough))
-            .map_err(|e| Error::InvalidConfig(format!("mitm: {e}")))?,
-        None => None,
-    };
+    // HTTPS decryption and rewrites (our fork): none without a CA and
+    // hosts, or rewrites.
+    let mitm =
+        app::mitm::Mitm::new(config.mitm.as_ref(), config.http_rewrite.as_ref())
+            .map_err(|e| Error::InvalidConfig(format!("mitm: {e}")))?;
     let dispatcher = Arc::new(
         Dispatcher::new(
             outbound_manager.clone(),
