@@ -677,14 +677,23 @@ async fn create_components(
         .await;
 
     debug!("initializing dispatcher");
-    let dispatcher = Arc::new(Dispatcher::new(
-        outbound_manager.clone(),
-        router.clone(),
-        dns_resolver.clone(),
-        config.general.mode,
-        statistics_manager.clone(),
-        config.experimental.as_ref().and_then(|e| e.tcp_buffer_size),
-    ));
+    // HTTPS decryption (our fork): without a CA or hosts, none.
+    let mitm = match config.mitm.as_ref() {
+        Some(m) => app::mitm::Mitm::new(m, Arc::new(app::mitm::Passthrough))
+            .map_err(|e| Error::InvalidConfig(format!("mitm: {e}")))?,
+        None => None,
+    };
+    let dispatcher = Arc::new(
+        Dispatcher::new(
+            outbound_manager.clone(),
+            router.clone(),
+            dns_resolver.clone(),
+            config.general.mode,
+            statistics_manager.clone(),
+            config.experimental.as_ref().and_then(|e| e.tcp_buffer_size),
+        )
+        .with_mitm(mitm),
+    );
 
     let closed_flows_cap = config
         .experimental

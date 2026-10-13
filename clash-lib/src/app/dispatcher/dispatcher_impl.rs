@@ -41,6 +41,8 @@ pub struct Dispatcher {
     mode: Arc<RwLock<RunMode>>,
     manager: Arc<Manager>,
     tcp_buffer_size: usize,
+    /// HTTPS decryption of listed hosts (our fork).
+    mitm: Option<Arc<crate::app::mitm::Mitm>>,
 }
 
 impl Debug for Dispatcher {
@@ -65,7 +67,14 @@ impl Dispatcher {
             mode: Arc::new(RwLock::new(mode)),
             manager: statistics_manager,
             tcp_buffer_size: tcp_buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE),
+            mitm: None,
         }
+    }
+
+    /// Decrypts the hosts `mitm` lists (our fork).
+    pub fn with_mitm(mut self, mitm: Option<Arc<crate::app::mitm::Mitm>>) -> Self {
+        self.mitm = mitm;
+        self
     }
 
     pub async fn set_mode(&self, mode: RunMode) {
@@ -138,6 +147,12 @@ impl Dispatcher {
                     rule.map(|r| r.matcher()),
                 )
                 .await;
+                if let Some(mitm) = self.mitm.as_ref().filter(|m| m.decrypts(&sess)) {
+                    if let Err(e) = mitm.clone().serve(&sess, lhs, rhs).await {
+                        warn!("MITM {}: {}", sess, e);
+                    }
+                    return;
+                }
                 match copy_bidirectional(
                     lhs,
                     rhs,
@@ -243,6 +258,7 @@ impl Dispatcher {
         let resolver = self.resolver.clone();
         let mode = self.mode.clone();
         let manager = self.manager.clone();
+        let mitm = self.mitm.clone();
 
         #[rustfmt::skip]
         /*
@@ -304,6 +320,13 @@ impl Dispatcher {
                     .to_canonical();
                 sess.destination = dest.clone();
                 sess.inbound_user = packet.inbound_user.clone();
+
+                // QUIC to a host that is decrypted: refused, so the client
+                // falls back to TCP (our fork).
+                if mitm.as_ref().is_some_and(|m| m.blocks_quic(&sess)) {
+                    debug!("QUIC to {} refused: HTTPS decryption", sess.destination);
+                    continue;
+                }
 
                 let mode = *mode.read().await;
 

@@ -75,7 +75,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["loggin
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2"] }
 rustls = { version = "0.23", default-features = false }
 rustls-pemfile = "2"
-rcgen = { version = "0.14", default-features = false, features = ["pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "x509-parser"] }
 webpki-roots = "1.0"
 
 # Error handing & logging

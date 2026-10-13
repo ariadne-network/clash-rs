@@ -32,6 +32,7 @@ pub struct Config {
     pub dns: dns::Config,
     pub tun: TunConfig,
     pub experimental: Option<def::Experimental>,
+    pub mitm: Option<def::MitmConfig>,
     pub profile: Profile,
     pub rules: Vec<RuleType>,
     pub rule_providers: HashMap<String, RuleProviderDef>,

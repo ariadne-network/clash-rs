@@ -477,6 +477,9 @@ pub struct Config {
     /// experimental settings, if any
     pub experimental: Option<Experimental>,
 
+    /// HTTPS decryption (our fork, app::mitm)
+    pub mitm: Option<MitmConfig>,
+
     /// tun settings
     /// # Example
     /// ```yaml
@@ -738,6 +741,25 @@ pub struct EdnsClientSubnet {
     pub ipv4: Option<String>,
     /// IPv6 subnet expressed in CIDR notation, e.g. `2001:db8::/56`
     pub ipv6: Option<String>,
+}
+
+/// HTTPS decryption (our fork, app::mitm): the hosts (Surge's list
+/// syntax) and the CA, PEM.
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct MitmConfig {
+    pub hostname: Vec<String>,
+    pub ca_cert: Option<String>,
+    pub ca_key: Option<String>,
+    /// HTTP/2 between the client and the engine (Surge's `h2`).
+    pub h2: bool,
+    pub skip_server_cert_verify: bool,
+    #[serde(default = "default_true")]
+    pub auto_quic_block: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Default)]

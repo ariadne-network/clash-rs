@@ -3,6 +3,7 @@ pub mod dispatcher;
 pub mod dns;
 pub mod inbound;
 pub mod logging;
+pub mod mitm;
 pub mod net;
 pub mod outbound;
 pub mod profile;

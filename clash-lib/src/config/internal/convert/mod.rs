@@ -55,6 +55,7 @@ pub(super) fn convert(mut c: def::Config) -> Result<config::Config, crate::Error
         general: general::convert(&c)?,
         dns: (&c).try_into()?,
         experimental: c.experimental.take(),
+        mitm: c.mitm.take(),
         tun: tun::convert(c.tun.take())?,
         profile: Profile {
             store_selected: c.profile.store_selected,
