@@ -758,6 +758,9 @@ pub struct MitmConfig {
     pub skip_server_cert_verify: bool,
     #[serde(default = "default_true")]
     pub auto_quic_block: bool,
+    /// Decrypt a listed host only when a rewrite or script may apply to it.
+    #[serde(default)]
+    pub only_used_hosts: bool,
 }
 
 fn default_true() -> bool {

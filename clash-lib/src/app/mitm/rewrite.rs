@@ -148,7 +148,7 @@ fn url_host(url: &str) -> String {
 /// a literal host, followed by the path, port, query or `$`
 /// (`^https?:\/\/api\.example\.com\/`), with no alternative at its top
 /// level. An unescaped dot in the host is taken for a dot.
-fn bound_host(p: &str) -> Option<String> {
+pub(crate) fn bound_host(p: &str) -> Option<String> {
     if top_level_alternation(p) {
         return None;
     }
@@ -209,6 +209,8 @@ fn top_level_alternation(p: &str) -> bool {
 
 pub struct Rewriter {
     config: RewriteConfig,
+    /// The hosts the patterns may apply to, worked out when first asked.
+    hosts: OnceLock<super::hosts::PatternHosts>,
     url: Patterns,
     map_local: Patterns,
     header: Patterns,
@@ -258,6 +260,7 @@ impl Rewriter {
             body_res,
             header_res,
             max_body: config.max_body_size.unwrap_or(DEFAULT_MAX_BODY),
+            hosts: OnceLock::new(),
             config,
         }
     }
@@ -441,6 +444,22 @@ fn gzip(data: &[u8]) -> Vec<u8> {
 
 #[async_trait]
 impl HttpProcessor for Rewriter {
+    fn uses_host(&self, host: &str, port: u16) -> bool {
+        self.hosts
+            .get_or_init(|| {
+                let c = &self.config;
+                super::hosts::PatternHosts::new(
+                    c.url
+                        .iter()
+                        .map(|r| r.pattern.as_str())
+                        .chain(c.map_local.iter().map(|r| r.pattern.as_str()))
+                        .chain(c.header.iter().map(|r| r.pattern.as_str()))
+                        .chain(c.body.iter().map(|r| r.pattern.as_str())),
+                )
+            })
+            .may_apply(host, port)
+    }
+
     fn wants(&self, url: &str) -> bool {
         [&self.url, &self.map_local, &self.header, &self.body]
             .iter()

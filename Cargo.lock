@@ -1519,6 +1519,7 @@ dependencies = [
  "rand_chacha 0.10.0",
  "rcgen 0.14.10",
  "regex",
+ "regex-automata",
  "register-count",
  "reqwest",
  "russh",

@@ -21,6 +21,7 @@
 
 mod ca;
 mod fetch;
+mod hosts;
 mod jq;
 mod rewrite;
 mod verdicts;
@@ -55,6 +56,7 @@ use tracing::{debug, info, warn};
 pub use ca::{Authority, generate_ca};
 pub(crate) use fetch::set_dispatcher;
 pub use fetch::{engine_runtime, fetch};
+pub use hosts::PatternHosts;
 pub use jq::jq_compiles;
 pub use rewrite::{Collected, RewriteConfig, Rewriter, collect, decompress};
 pub use verdicts::{ClientVerdict, clear_client_verdicts, client_verdicts};
@@ -104,6 +106,12 @@ pub trait HttpProcessor: Send + Sync {
         true
     }
 
+    /// Whether anything may apply to requests to `host` on `port`
+    /// (`only-used-hosts`: other listed hosts are not decrypted).
+    fn uses_host(&self, _host: &str, _port: u16) -> bool {
+        true
+    }
+
     async fn request(&self, _url: &str, req: Request<Body>) -> RequestOutcome {
         RequestOutcome::Forward(req)
     }
@@ -121,7 +129,11 @@ pub trait HttpProcessor: Send + Sync {
 /// Changes nothing.
 pub struct Passthrough;
 
-impl HttpProcessor for Passthrough {}
+impl HttpProcessor for Passthrough {
+    fn uses_host(&self, _host: &str, _port: u16) -> bool {
+        false
+    }
+}
 
 /// The application's processor that runs after the rewrites (scripts),
 /// set before the engine starts.
@@ -139,6 +151,10 @@ struct Chain(Arc<dyn HttpProcessor>, Arc<dyn HttpProcessor>);
 impl HttpProcessor for Chain {
     fn wants(&self, url: &str) -> bool {
         self.0.wants(url) || self.1.wants(url)
+    }
+
+    fn uses_host(&self, host: &str, port: u16) -> bool {
+        self.0.uses_host(host, port) || self.1.uses_host(host, port)
     }
 
     async fn request(&self, url: &str, req: Request<Body>) -> RequestOutcome {
@@ -175,6 +191,8 @@ pub struct Mitm {
     rewrites: bool,
     h2: bool,
     quic_block: bool,
+    /// Listed hosts are decrypted only when a rewrite or script may apply.
+    only_used: bool,
     processor: Arc<dyn HttpProcessor>,
     /// Upstream configurations by what the client offered: h2 and
     /// HTTP/1.1, h2 only, HTTP/1.1 only.
@@ -240,6 +258,7 @@ impl Mitm {
             rewrites: processes,
             h2: mitm.is_some_and(|m| m.h2),
             quic_block: mitm.is_some_and(|m| m.auto_quic_block),
+            only_used: mitm.is_some_and(|m| m.only_used_hosts),
             processor,
             upstream_h2_h1: upstream(&[b"h2", b"http/1.1"]),
             upstream_h2: upstream(&[b"h2"]),
@@ -269,7 +288,14 @@ impl Mitm {
     }
 
     fn decrypts(&self, dest: &SocksAddr) -> bool {
-        self.authority.is_some() && self.listed(dest)
+        self.authority.is_some()
+            && self.listed(dest)
+            && self.used(&dest.host(), dest.port())
+    }
+
+    /// With `only-used-hosts`, whether a rewrite or script may apply.
+    fn used(&self, host: &str, port: u16) -> bool {
+        !self.only_used || self.processor.uses_host(host, port)
     }
 
     fn reads_plain(&self, dest: &SocksAddr) -> bool {
@@ -333,6 +359,7 @@ impl Mitm {
                     read_record(&mut lhs, &mut prefix, deadline).await;
                     server_name(&prefix).is_some_and(|name| {
                         self.hosts.matches(&name, sess.destination.port())
+                            && self.used(&name, sess.destination.port())
                     })
                 });
         let lhs = Rewind {
@@ -1054,6 +1081,40 @@ mod tests {
         assert!(
             !mitm.blocks_quic(&udp(SocksAddr::Domain("a.example.com".into(), 8443)))
         );
+    }
+
+    #[test]
+    fn only_used_hosts_are_decrypted() {
+        crate::setup_default_crypto_provider();
+        let (cert, key) = generate_ca("Test CA").unwrap();
+        let config = MitmConfig {
+            hostname: vec!["*.example.com".into()],
+            ca_cert: Some(cert),
+            ca_key: Some(key),
+            auto_quic_block: true,
+            only_used_hosts: true,
+            ..Default::default()
+        };
+        let rewrite = RewriteConfig {
+            url: vec![crate::config::def::UrlRewrite {
+                pattern: r"^https?:\/\/(ads|track)\.example\.com\/".into(),
+                replacement: "-".into(),
+                kind: "reject".into(),
+            }],
+            ..Default::default()
+        };
+        let mitm = Mitm::new(Some(&config), Some(&rewrite)).unwrap().unwrap();
+        let session = |network, host: &str| Session {
+            network,
+            destination: SocksAddr::Domain(host.into(), 443),
+            ..Default::default()
+        };
+        // A host a rewrite is written for: decrypted, its QUIC refused.
+        assert!(mitm.handles(&session(Network::Tcp, "ads.example.com")));
+        assert!(mitm.blocks_quic(&session(Network::Udp, "ads.example.com")));
+        // Listed, but nothing applies: neither.
+        assert!(!mitm.handles(&session(Network::Tcp, "video.example.com")));
+        assert!(!mitm.blocks_quic(&session(Network::Udp, "video.example.com")));
     }
 
     #[test]
