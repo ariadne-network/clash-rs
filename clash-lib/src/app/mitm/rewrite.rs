@@ -327,6 +327,13 @@ impl Rewriter {
     fn rewrite_text(&self, rules: &[usize], text: &str) -> String {
         let mut text = text.to_owned();
         for i in rules {
+            if let Some(code) = &self.config.body[*i].jq {
+                match super::jq::apply(code, &text) {
+                    Some(new) => text = new,
+                    None => debug!("jq body rewrite: no output; unchanged"),
+                }
+                continue;
+            }
             for (re, rep) in &self.body_res[*i] {
                 if let Some(re) = re {
                     text = re.replace_all(&text, rep.as_str()).into_owned();
@@ -668,6 +675,7 @@ mod tests {
                 response: true,
                 pattern: "^https://a\\.test/page".into(),
                 pairs: vec![("\"ad\":true".into(), "\"ad\":false".into())],
+                jq: None,
             }],
             ..Default::default()
         })
@@ -799,6 +807,7 @@ mod tests {
                 response: true,
                 pattern: "^https://a\\.test/".into(),
                 pairs: vec![("a".into(), "b".into())],
+                jq: None,
             }],
             max_body_size: Some(8),
             ..Default::default()

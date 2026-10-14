@@ -833,7 +833,11 @@ pub struct BodyRewrite {
     pub response: bool,
     pub pattern: String,
     /// Regular expression and replacement, in turn.
+    #[serde(default)]
     pub pairs: Vec<(String, String)>,
+    /// A jq filter for a JSON body, in place of the pairs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jq: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]

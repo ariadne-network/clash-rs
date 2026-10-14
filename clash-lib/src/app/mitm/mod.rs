@@ -21,14 +21,16 @@
 
 mod ca;
 mod fetch;
+mod jq;
 mod rewrite;
+mod verdicts;
 
 use std::{
     io,
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::Duration,
@@ -53,7 +55,9 @@ use tracing::{debug, info, warn};
 pub use ca::{Authority, generate_ca};
 pub(crate) use fetch::set_dispatcher;
 pub use fetch::{engine_runtime, fetch};
+pub use jq::jq_compiles;
 pub use rewrite::{Collected, RewriteConfig, Rewriter, collect, decompress};
+pub use verdicts::{ClientVerdict, clear_client_verdicts, client_verdicts};
 
 use crate::{
     common::{
@@ -342,6 +346,7 @@ impl Mitm {
                     mitm: self,
                     scheme: "http",
                     host,
+                    requests: AtomicU32::new(0),
                 });
                 debug!("HTTP {}", site.host);
                 serve_h1(site, lhs, rhs).await
@@ -414,6 +419,7 @@ impl Mitm {
             vec![b"http/1.1".to_vec()]
         };
         let client = start.into_stream(Arc::new(server)).await.map_err(|e| {
+            verdicts::note(&host, 1, 0, 0);
             io::Error::other(format!(
                 "{host}: the client refused the certificate ({e}); is the CA \
                  trusted, or does the app pin its certificates?"
@@ -428,27 +434,38 @@ impl Mitm {
             mitm: self.clone(),
             scheme: "https",
             host,
+            requests: AtomicU32::new(0),
         });
-        if !upstream_h2 {
-            return serve_h1(site, client, upstream).await;
-        }
-        let (sender, conn) = hyper::client::conn::http2::handshake(
-            TokioExecutor::new(),
-            TokioIo::new(upstream),
-        )
-        .await
-        .map_err(io::Error::other)?;
-        tokio::spawn(conn);
-        let upstream = Upstream::H2(sender);
-        let service = service_fn(move |req| {
-            let site = site.clone();
-            let upstream = upstream.clone();
-            async move { site.handle(req, upstream).await }
-        });
-        hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-            .serve_connection(TokioIo::new(client), service)
+        let served = site.clone();
+        let result = async move {
+            if !upstream_h2 {
+                return serve_h1(site, client, upstream).await;
+            }
+            let (sender, conn) = hyper::client::conn::http2::handshake(
+                TokioExecutor::new(),
+                TokioIo::new(upstream),
+            )
             .await
-            .map_err(io::Error::other)
+            .map_err(io::Error::other)?;
+            tokio::spawn(conn);
+            let upstream = Upstream::H2(sender);
+            let service = service_fn(move |req| {
+                let site = site.clone();
+                let upstream = upstream.clone();
+                async move { site.handle(req, upstream).await }
+            });
+            hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(client), service)
+                .await
+                .map_err(io::Error::other)
+        }
+        .await;
+        // A client that closes an accepted handshake without a request may
+        // pin its certificates (verdicts).
+        let requests = served.requests.load(Ordering::Relaxed);
+        let silent = u32::from(requests == 0 && result.is_ok());
+        verdicts::note(&served.host, 0, silent, requests);
+        result
     }
 }
 
@@ -791,6 +808,8 @@ struct Site {
     /// "https" or "http".
     scheme: &'static str,
     host: String,
+    /// Requests the client sent on the connection.
+    requests: AtomicU32,
 }
 
 impl Site {
@@ -799,6 +818,7 @@ impl Site {
         mut req: Request<Incoming>,
         upstream: Upstream,
     ) -> Result<Response<Body>, Dropped> {
+        self.requests.fetch_add(1, Ordering::Relaxed);
         let url = self.url(&req);
         let client_upgrade = is_upgrade(&req).then(|| hyper::upgrade::on(&mut req));
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);

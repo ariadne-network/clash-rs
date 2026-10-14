@@ -145,6 +145,10 @@ chrono = { version = "0.4", features = ["serde"] }
 # Dashboard auto-download
 zip = { version = "8", default-features = false, features = ["deflate"] }
 flate2 = "1"
+# jq body rewrites (app::mitm::jq).
+jaq-core = "3.1.1"
+jaq-std = "3.0.3"
+jaq-json = "2.0.3"
 tar = "0.4"
 
 # Builtin dashboard
