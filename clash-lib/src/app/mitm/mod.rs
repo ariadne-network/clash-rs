@@ -27,10 +27,12 @@ mod rewrite;
 mod verdicts;
 
 use std::{
+    collections::HashMap,
     io,
+    net::IpAddr,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -199,7 +201,15 @@ pub struct Mitm {
     upstream_h2_h1: Arc<ClientConfig>,
     upstream_h2: Arc<ClientConfig>,
     upstream_h1: Arc<ClientConfig>,
+    /// The server names TLS asked for at an address (apps that resolve
+    /// names themselves): QUIC to it is refused only when one is
+    /// decrypted, or none is known yet.
+    names: Mutex<HashMap<IpAddr, Vec<String>>>,
 }
+
+/// Addresses whose names are kept, and names kept per address.
+const NAMED_ADDRESSES: usize = 4096;
+const NAMES_PER_ADDRESS: usize = 4;
 
 impl std::fmt::Debug for Mitm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -263,6 +273,7 @@ impl Mitm {
             upstream_h2_h1: upstream(&[b"h2", b"http/1.1"]),
             upstream_h2: upstream(&[b"h2"]),
             upstream_h1: upstream(&[b"http/1.1"]),
+            names: Mutex::new(HashMap::new()),
         })))
     }
 
@@ -309,13 +320,45 @@ impl Mitm {
 
     /// Whether this UDP session is refused, so the client tries TCP, where
     /// it can be decrypted: QUIC to a listed host, or to an address (an app
-    /// that resolves names itself), whose server name QUIC does not show.
+    /// that resolves names itself), whose server name QUIC does not show:
+    /// unless the names its TLS asked for are known and none is decrypted.
     pub fn blocks_quic(&self, sess: &Session) -> bool {
         self.quic_block
             && sess.network == Network::Udp
             && sess.destination.port() == 443
             && (self.decrypts(&sess.destination)
-                || self.decrypts_by_name(&sess.destination))
+                || self.decrypts_by_name(&sess.destination)
+                    && match &sess.destination {
+                        SocksAddr::Ip(addr) => self.named_decrypted(addr.ip()),
+                        SocksAddr::Domain(..) => true,
+                    })
+    }
+
+    /// Notes a server name TLS asked for at an address.
+    fn learn(&self, ip: IpAddr, name: &str) {
+        let mut names = self.names.lock().unwrap();
+        if names.len() >= NAMED_ADDRESSES && !names.contains_key(&ip) {
+            names.clear();
+        }
+        let list = names.entry(ip).or_default();
+        let name = name.to_ascii_lowercase();
+        if !list.contains(&name) {
+            if list.len() == NAMES_PER_ADDRESS {
+                list.remove(0);
+            }
+            list.push(name);
+        }
+    }
+
+    /// Whether QUIC to this address may be to a decrypted host: none of its
+    /// names known yet, or one of them decrypted.
+    fn named_decrypted(&self, ip: IpAddr) -> bool {
+        let names = self.names.lock().unwrap().get(&ip).cloned();
+        names.is_none_or(|names| {
+            names
+                .iter()
+                .any(|n| self.hosts.matches(n, 443) && self.used(n, 443))
+        })
     }
 
     fn listed(&self, dest: &SocksAddr) -> bool {
@@ -358,6 +401,9 @@ impl Mitm {
                 || self.decrypts_by_name(&sess.destination) && {
                     read_record(&mut lhs, &mut prefix, deadline).await;
                     server_name(&prefix).is_some_and(|name| {
+                        if let SocksAddr::Ip(addr) = &sess.destination {
+                            self.learn(addr.ip(), &name);
+                        }
                         self.hosts.matches(&name, sess.destination.port())
                             && self.used(&name, sess.destination.port())
                     })
@@ -1081,6 +1127,20 @@ mod tests {
         assert!(
             !mitm.blocks_quic(&udp(SocksAddr::Domain("a.example.com".into(), 8443)))
         );
+        // An address whose TLS named only hosts not decrypted: its QUIC
+        // passes; one that named a decrypted host too stays refused.
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let quic_to = |s: &str| {
+            udp(format!("{s}:443")
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into())
+        };
+        mitm.learn(ip("203.0.113.2"), "cdn.other.test");
+        assert!(!mitm.blocks_quic(&quic_to("203.0.113.2")));
+        mitm.learn(ip("203.0.113.3"), "cdn.other.test");
+        mitm.learn(ip("203.0.113.3"), "a.example.com");
+        assert!(mitm.blocks_quic(&quic_to("203.0.113.3")));
     }
 
     #[test]
