@@ -1,5 +1,5 @@
 use crate::{
-    Packet, device::NetstackDevice, packet::IpPacket,
+    Packet, device::NetstackDevice, packet::IpPacket, pages::Pages,
     ring_buffer::LockFreeRingBuffer, stack::IfaceEvent, tcp_stream::TcpStream,
 };
 use futures::task::AtomicWaker;
@@ -33,6 +33,17 @@ const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 256 * 1024; // 256 KiB
 const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 128 * 1024;
 #[cfg(target_os = "ios")]
 const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 128 * 1024;
+
+/// A send buffer that carried this much since its pages were given back
+/// gives them back again once all of it is acknowledged (our fork).
+const RELEASE_SEND_PAGES_AFTER: usize = 64 * 1024;
+
+/// A socket's send buffer, and what passed through it since its pages
+/// were last given back.
+pub(crate) struct SendPages {
+    pages: Pages,
+    passed: usize,
+}
 
 /// Time-to-live for SYN tracker entries. Duplicates within this window are
 /// suppressed to prevent the same SYN from creating multiple smoltcp sockets.
@@ -267,17 +278,24 @@ impl TcpListener {
                         continue;
                     }
 
+                    // The send buffer in pages of its own (pages.rs); the
+                    // receive buffer stays in the allocator: smoltcp keeps
+                    // segments that came out of order past what it holds,
+                    // so it is never known to be unused.
+                    let send_pages = SendPages {
+                        pages: Pages::new(DEFAULT_TCP_SEND_BUFFER_SIZE as usize),
+                        passed: 0,
+                    };
                     let mut socket = tcp::Socket::new(
                         tcp::SocketBuffer::new(vec![
                             0u8;
                             DEFAULT_TCP_RECV_BUFFER_SIZE
                                 as usize
                         ]),
-                        tcp::SocketBuffer::new(vec![
-                            0u8;
-                            DEFAULT_TCP_SEND_BUFFER_SIZE
-                                as usize
-                        ]),
+                        // SAFETY: the socket goes before its pages: they
+                        // come after it in the event and in `socket_maps`,
+                        // and the socket set is dropped first.
+                        tcp::SocketBuffer::new(unsafe { send_pages.pages.buffer() }),
                     );
                     socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
                         28,
@@ -317,7 +335,9 @@ impl TcpListener {
                             std::io::Error::other("Failed to send TCP stream")
                         })?;
                     iface_notifier
-                        .send(IfaceEvent::TcpStream(Box::new((socket, handle))))
+                        .send(IfaceEvent::TcpStream(Box::new((
+                            socket, handle, send_pages,
+                        ))))
                         .map_err(|e| {
                             error!("Failed to send TCP stream event: {e}");
                             std::io::Error::other("Failed to send TCP stream event")
@@ -350,12 +370,14 @@ impl TcpListener {
         device: &mut NetstackDevice,
         mut notifier_rx: mpsc::UnboundedReceiver<IfaceEvent<'_>>,
     ) -> std::io::Result<()> {
-        // Create a socket set for TCP sockets
-        let mut sockets = smoltcp::iface::SocketSet::new(vec![]);
+        // Declared first so it is dropped last, after the sockets that use
+        // its send buffers.
         let mut socket_maps: HashMap<
             smoltcp::iface::SocketHandle,
-            Arc<TcpStreamHandle>,
+            (Arc<TcpStreamHandle>, SendPages),
         > = HashMap::new();
+        // Create a socket set for TCP sockets
+        let mut sockets = smoltcp::iface::SocketSet::new(vec![]);
         let mut next_poll = None;
 
         loop {
@@ -402,8 +424,9 @@ impl TcpListener {
                 loop {
                     match notifier_rx.try_recv() {
                         Ok(IfaceEvent::TcpStream(stream)) => {
-                            let socket_handle = sockets.add(stream.0);
-                            socket_maps.insert(socket_handle, stream.1);
+                            let (socket, control, pages) = *stream;
+                            let socket_handle = sockets.add(socket);
+                            socket_maps.insert(socket_handle, (control, pages));
                         }
                         Ok(_) => {
                             // DeviceReady, TcpSocketReady, TcpSocketClosed:
@@ -417,7 +440,9 @@ impl TcpListener {
                 iface.poll(now, device, &mut sockets);
 
                 // Poll the sockets for new connections or data
-                for (socket_handle, socket_control) in socket_maps.iter() {
+                for (socket_handle, (socket_control, send_pages)) in
+                    socket_maps.iter_mut()
+                {
                     let socket = sockets.get_mut::<tcp::Socket>(*socket_handle);
                     trace!(
                         "Polling TCP socket: {:?}, can_recv: {}, can_send: {}",
@@ -449,9 +474,17 @@ impl TcpListener {
                             (n, n)
                         }) {
                             trace!("Sent {n} bytes to TCP socket");
-                            let _ = n;
+                            send_pages.passed += n;
                         }
                         notify_write = true;
+                    }
+                    // All of it sent and acknowledged: the pages a download
+                    // used go back.
+                    if send_pages.passed >= RELEASE_SEND_PAGES_AFTER
+                        && socket.send_queue() == 0
+                    {
+                        send_pages.pages.release();
+                        send_pages.passed = 0;
                     }
 
                     if notify_write {
@@ -494,7 +527,7 @@ impl TcpListener {
                     }
                 }
 
-                socket_maps.retain(|handle, socket_control| {
+                socket_maps.retain(|handle, (socket_control, _)| {
                     let socket = sockets.get_mut::<tcp::Socket>(*handle);
 
                     if socket_control
@@ -576,8 +609,9 @@ impl TcpListener {
                         next_poll = None; // reset the next poll time
                         match event {
                             IfaceEvent::TcpStream(stream) => {
-                                let socket_handle = sockets.add(stream.0);
-                                socket_maps.insert(socket_handle, stream.1);
+                                let (socket, control, pages) = *stream;
+                                let socket_handle = sockets.add(socket);
+                                socket_maps.insert(socket_handle, (control, pages));
                                 trace!("Added new TCP socket: {socket_handle:?}");
                             }
                             IfaceEvent::TcpSocketReady => {

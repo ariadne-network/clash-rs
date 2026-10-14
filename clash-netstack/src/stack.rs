@@ -14,7 +14,7 @@ use crate::{
     UdpSocket,
     debug::trace_ip_packet,
     packet::IpPacket,
-    tcp_listener::{TcpListener, TcpStreamHandle},
+    tcp_listener::{SendPages, TcpListener, TcpStreamHandle},
 };
 
 /// Thin `Stream` wrapper around a bounded `mpsc::Receiver`.
@@ -33,7 +33,14 @@ impl Stream for ReceiverStream {
 
 pub(crate) enum IfaceEvent<'a> {
     Icmp, // ICMP packet received
-    TcpStream(Box<(smoltcp::socket::tcp::Socket<'a>, Arc<TcpStreamHandle>)>), /* new TCP stream created */
+    TcpStream(
+        Box<(
+            smoltcp::socket::tcp::Socket<'a>,
+            Arc<TcpStreamHandle>,
+            SendPages,
+        )>,
+    ), /* new TCP stream created, its send buffer last (dropped after the
+           * socket) */
     TcpSocketReady, // at least one TCP socket is ready to read/write
     TcpSocketClosed, /* TCP socket closed by the application, e.g. the TcpStream
                      * is dropped */
