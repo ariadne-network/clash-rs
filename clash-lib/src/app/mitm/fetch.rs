@@ -1,7 +1,7 @@
 //! HTTP requests of the engine's own (our fork), as the application's
 //! scripts make them: they go through the dispatcher like any connection,
-//! so the rules choose their policy and they show among the connections.
-//! They are never decrypted (`Type::Ignore`).
+//! so the rules choose their policy (unless the request names one) and they
+//! show among the connections. They are never decrypted (`Type::Ignore`).
 
 use std::{
     io,
@@ -40,8 +40,18 @@ pub fn engine_runtime() -> Option<tokio::runtime::Handle> {
 /// Sends `req` (an absolute http or https URL) through the engine, over
 /// HTTP/1.1, and gives the response once its head arrived.
 pub async fn fetch(
+    req: Request<Body>,
+    timeout: Duration,
+) -> io::Result<Response<Incoming>> {
+    fetch_via(req, timeout, None).await
+}
+
+/// As `fetch`, by the outbound (a proxy or group) `policy` names, not the
+/// rules.
+pub async fn fetch_via(
     mut req: Request<Body>,
     timeout: Duration,
+    policy: Option<&str>,
 ) -> io::Result<Response<Incoming>> {
     let dispatcher = DISPATCHER
         .read()
@@ -49,6 +59,12 @@ pub async fn fetch(
         .as_ref()
         .and_then(Weak::upgrade)
         .ok_or_else(|| io::Error::other("the engine is not running"))?;
+    let policy = policy.map(str::to_owned);
+    if let Some(name) = &policy
+        && !dispatcher.has_outbound(name).await
+    {
+        return Err(io::Error::other(format!("no policy named {name}")));
+    }
     let uri = req.uri().clone();
     let https = match uri.scheme_str() {
         Some("https") => true,
@@ -75,7 +91,7 @@ pub async fn fetch(
     let (client, engine_side) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         dispatcher
-            .dispatch_stream(sess, Box::new(engine_side))
+            .dispatch_stream_via(sess, Box::new(engine_side), policy.as_deref())
             .await;
     });
 

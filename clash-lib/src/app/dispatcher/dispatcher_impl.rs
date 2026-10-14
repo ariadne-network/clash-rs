@@ -92,11 +92,23 @@ impl Dispatcher {
         *self.mode.read().await
     }
 
+    pub async fn dispatch_stream(&self, sess: Session, lhs: Box<dyn ProxyStream>) {
+        self.dispatch_stream_via(sess, lhs, None).await
+    }
+
+    /// Whether an outbound (a proxy or group) has this name (our fork).
+    pub async fn has_outbound(&self, name: &str) -> bool {
+        self.outbound_manager.get_outbound(name).await.is_some()
+    }
+
+    /// As `dispatch_stream`, by the outbound `outbound` names when it names
+    /// one, not the rules (our fork: a script's request with a policy).
     #[instrument(skip(self, sess, lhs))]
-    pub async fn dispatch_stream(
+    pub async fn dispatch_stream_via(
         &self,
         mut sess: Session,
         mut lhs: Box<dyn ProxyStream>,
+        outbound: Option<&str>,
     ) {
         let dest: SocksAddr =
             match reverse_lookup(&self.resolver, &sess.destination).await {
@@ -110,10 +122,11 @@ impl Dispatcher {
         sess.destination = dest.clone();
 
         let mode = *self.mode.read().await;
-        let (outbound_name, rule) = match mode {
-            RunMode::Global => (PROXY_GLOBAL, None),
-            RunMode::Rule => self.router.match_route(&mut sess).await,
-            RunMode::Direct => (PROXY_DIRECT, None),
+        let (outbound_name, rule) = match (outbound, mode) {
+            (Some(name), _) => (name, None),
+            (None, RunMode::Global) => (PROXY_GLOBAL, None),
+            (None, RunMode::Rule) => self.router.match_route(&mut sess).await,
+            (None, RunMode::Direct) => (PROXY_DIRECT, None),
         };
 
         if let Some(interface) = rule.and_then(|rule| rule.interface()) {

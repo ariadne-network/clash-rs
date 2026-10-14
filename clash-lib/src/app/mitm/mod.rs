@@ -57,7 +57,7 @@ use tracing::{debug, info, warn};
 
 pub use ca::{Authority, generate_ca};
 pub(crate) use fetch::set_dispatcher;
-pub use fetch::{engine_runtime, fetch};
+pub use fetch::{engine_runtime, fetch, fetch_via};
 pub use hosts::PatternHosts;
 pub use jq::jq_compiles;
 pub use rewrite::{Collected, RewriteConfig, Rewriter, collect, decompress};
@@ -97,6 +97,19 @@ pub enum RequestOutcome {
     /// No answer: the connection (HTTP/1.1) or the stream (HTTP/2) is
     /// dropped.
     Drop,
+}
+
+/// A response a processor marks with this extension is not delivered:
+/// the connection (HTTP/1.1) or the stream (HTTP/2) is dropped, as for
+/// `RequestOutcome::Drop` (a script's `abort` on a response).
+#[derive(Clone, Copy, Debug)]
+pub struct DropResponse;
+
+/// A response to drop (`DropResponse`).
+pub fn dropped_response() -> Response<Body> {
+    let mut resp = Response::new(full_body(Bytes::new()));
+    resp.extensions_mut().insert(DropResponse);
+    resp
 }
 
 /// Rewrites and scripts on decrypted HTTP. `url` is the request's full URL.
@@ -192,6 +205,9 @@ impl HttpProcessor for Chain {
         resp: Response<Body>,
     ) -> Response<Body> {
         let resp = self.0.response(url, request, resp).await;
+        if resp.extensions().get::<DropResponse>().is_some() {
+            return resp;
+        }
         self.1.response(url, request, resp).await
     }
 }
@@ -962,7 +978,11 @@ impl Site {
             });
         }
         let resp = resp.map(BodyExt::boxed);
-        Ok(self.mitm.processor.response(&url, &head, resp).await)
+        let resp = self.mitm.processor.response(&url, &head, resp).await;
+        if resp.extensions().get::<DropResponse>().is_some() {
+            return Err(Dropped);
+        }
+        Ok(resp)
     }
 
     /// The full URL: HTTP/2 requests carry it, HTTP/1.1 ones the path and
