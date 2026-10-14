@@ -45,6 +45,8 @@ pub async fn new_tcp_stream(
     iface: Option<&OutboundInterface>,
     #[cfg(target_os = "linux")] so_mark: Option<u32>,
 ) -> std::io::Result<TcpStream> {
+    // On an IPv6-only network, an IPv4 endpoint through its NAT64 (our fork).
+    let endpoint = crate::app::net::nat64::reachable(endpoint);
     let (socket, family) = match endpoint {
         SocketAddr::V4(_) => (
             socket2::Socket::new(

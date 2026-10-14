@@ -168,7 +168,10 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
         // destinations to be expressed as IPv4-mapped IPv6 addresses
         // (::ffff:x.x.x.x). Tokio's poll_send_to does not do this automatically
         // and will return EINVAL otherwise.
-        let send_dst = match (inner.local_addr()?.is_ipv6(), dst) {
+        // On an IPv6-only network, an IPv4 destination through its NAT64
+        // (our fork); its replies come from there.
+        let reached = crate::app::net::nat64::reachable(dst);
+        let send_dst = match (inner.local_addr()?.is_ipv6(), reached) {
             (true, SocketAddr::V4(v4)) => {
                 SocketAddr::V6(std::net::SocketAddrV6::new(
                     v4.ip().to_ipv6_mapped(),
@@ -177,7 +180,7 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
                     0,
                 ))
             }
-            _ => dst,
+            _ => reached,
         };
 
         let n = ready!(inner.poll_send_to(cx, p.data.as_slice(), send_dst))?;
@@ -186,6 +189,9 @@ impl Sink<UdpPacket> for OutboundDatagramImpl {
         ip_to_logical
             .retain(|_, (_, ts)| now.duration_since(*ts) < UDP_DOMAIN_MAP_TTL);
         ip_to_logical.insert(dst, (p.dst_addr.clone(), now));
+        if reached != dst {
+            ip_to_logical.insert(reached, (p.dst_addr.clone(), now));
+        }
         // Save length before clearing pkt (NLL ends p's borrow after this).
         let data_len = p.data.len();
 

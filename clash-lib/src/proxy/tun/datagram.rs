@@ -18,6 +18,7 @@ pub(crate) async fn handle_inbound_datagram(
     resolver: ThreadSafeDNSResolver,
     so_mark: Option<u32>,
     dns_hijack: bool,
+    ipv6_tun: bool,
 ) {
     // tun i/o
     // lr: app packets went into tun will be accessed from lr
@@ -141,6 +142,24 @@ pub(crate) async fn handle_inbound_datagram(
                             };
 
                         trace!("hijack dns request: {:?}", msg);
+
+                        // AAAA while the TUN carries no IPv6, or with fake
+                        // IPs (IPv4 alone): an empty answer, as Surge gives
+                        // (our fork). Real addresses would send apps around
+                        // the TUN over IPv6, or past rules by domain.
+                        if (!ipv6_tun || resolver_dns.fake_ip_enabled())
+                            && msg.queries.first().map(|q| q.query_type())
+                                == Some(hickory_proto::rr::RecordType::AAAA)
+                        {
+                            let mut resp =
+                                crate::app::dns::helper::build_dns_response_message(
+                                    &msg, true, false,
+                                );
+                            resp.metadata.response_code =
+                                hickory_proto::op::ResponseCode::NoError;
+                            send_response(resp, &pkt).await;
+                            continue 'read_packet;
+                        }
 
                         let mut resp =
                             match exchange_with_resolver(&resolver_dns, &msg, true)

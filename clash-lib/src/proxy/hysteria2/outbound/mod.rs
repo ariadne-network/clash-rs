@@ -195,6 +195,9 @@ impl Handler {
                 SocketAddr::new(ip, port)
             }
         };
+        // On an IPv6-only network, through its NAT64 (our fork).
+        let server_socket_addr =
+            crate::app::net::nat64::reachable(server_socket_addr);
 
         // Here maybe we should use a AsyncUdpSocket which implement salamander
         // obfs and port hopping

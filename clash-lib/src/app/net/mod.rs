@@ -10,6 +10,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tracing::trace;
 
+/// IPv4 destinations on IPv6-only networks (our fork).
+pub mod nat64;
+
 pub static DEFAULT_OUTBOUND_INTERFACE: LazyLock<
     Arc<tokio::sync::RwLock<Option<OutboundInterface>>>,
 > = LazyLock::new(Default::default);
