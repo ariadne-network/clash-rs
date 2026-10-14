@@ -142,6 +142,21 @@ impl HttpProcessor for Passthrough {
 static AFTER_REWRITES: std::sync::RwLock<Option<Arc<dyn HttpProcessor>>> =
     std::sync::RwLock::new(None);
 
+/// Given the processors (the rewrites and the one after them), what runs
+/// in their place: one around them all, e.g. to record what they do.
+pub type ProcessorWrapper =
+    Arc<dyn Fn(Arc<dyn HttpProcessor>) -> Arc<dyn HttpProcessor> + Send + Sync>;
+
+static AROUND: std::sync::RwLock<Option<ProcessorWrapper>> =
+    std::sync::RwLock::new(None);
+
+/// The application's processor around all the others, set before the
+/// engine starts: it sees requests as they come from the client and what
+/// the rewrites and scripts make of them, answers included.
+pub fn set_processor_around(wrapper: Option<ProcessorWrapper>) {
+    *AROUND.write().unwrap() = wrapper;
+}
+
 pub fn set_processor_after_rewrites(processor: Option<Arc<dyn HttpProcessor>>) {
     *AFTER_REWRITES.write().unwrap() = processor;
 }
@@ -235,7 +250,12 @@ impl Mitm {
             _ => None,
         };
         let after = AFTER_REWRITES.read().unwrap().clone();
-        if authority.is_none() && rewrite.is_none() && after.is_none() {
+        let around = AROUND.read().unwrap().clone();
+        if authority.is_none()
+            && rewrite.is_none()
+            && after.is_none()
+            && around.is_none()
+        {
             return Ok(None);
         }
         let skip = mitm.is_some_and(|m| m.skip_server_cert_verify);
@@ -252,11 +272,15 @@ impl Mitm {
         let _ = &GLOBAL_ROOT_STORE; // the verifier's roots
         let rewriter: Option<Arc<dyn HttpProcessor>> =
             rewrite.map(|r| Arc::new(Rewriter::new(r.clone())) as _);
-        let processes = rewriter.is_some() || after.is_some();
+        let processes = rewriter.is_some() || after.is_some() || around.is_some();
         let processor: Arc<dyn HttpProcessor> = match (rewriter, after) {
             (Some(r), Some(a)) => Arc::new(Chain(r, a)),
             (Some(p), None) | (None, Some(p)) => p,
             (None, None) => Arc::new(Passthrough),
+        };
+        let processor = match &around {
+            Some(wrap) => wrap(processor),
+            None => processor,
         };
         Ok(Some(Arc::new(Self {
             hosts,
