@@ -812,6 +812,9 @@ pub struct MapLocal {
     pub headers: Vec<(String, String)>,
     /// The body, base64.
     pub body: String,
+    /// A file the body is read from at each request, in place of `body`
+    /// (our fork): its data is not kept in memory.
+    pub body_file: Option<String>,
     pub content_type: Option<String>,
 }
 

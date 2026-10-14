@@ -529,9 +529,22 @@ impl HttpProcessor for Rewriter {
 
         if let Some(i) = self.map_local.first(url) {
             let rule = &self.config.map_local[i];
-            let body = base64::engine::general_purpose::STANDARD
-                .decode(&rule.body)
-                .unwrap_or_default();
+            let body = match &rule.body_file {
+                Some(path) => match tokio::fs::read(path).await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        warn!("map-local file {path}: {e}");
+                        return RequestOutcome::Respond(answer(
+                            404,
+                            None,
+                            Bytes::new(),
+                        ));
+                    }
+                },
+                None => base64::engine::general_purpose::STANDARD
+                    .decode(&rule.body)
+                    .unwrap_or_default(),
+            };
             let mut resp = answer(
                 rule.status_code.unwrap_or(200),
                 rule.content_type.as_deref(),
@@ -657,6 +670,14 @@ mod tests {
         }
     }
 
+    /// A Map Local file of the tests.
+    fn map_local_file() -> std::path::PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("clash-map-local-{}.bin", std::process::id()));
+        std::fs::write(&path, b"GIF89a\x00\xff").unwrap();
+        path
+    }
+
     fn rewriter() -> Rewriter {
         Rewriter::new(RewriteConfig {
             url: vec![
@@ -676,13 +697,25 @@ mod tests {
                     kind: "reject-dict".into(),
                 },
             ],
-            map_local: vec![MapLocal {
-                pattern: r"^https://a\.test/splash".into(),
-                body: base64::engine::general_purpose::STANDARD
-                    .encode("{\"ads\":[]}"),
-                content_type: Some("application/json".into()),
-                ..Default::default()
-            }],
+            map_local: vec![
+                MapLocal {
+                    pattern: r"^https://a\.test/splash".into(),
+                    body: base64::engine::general_purpose::STANDARD
+                        .encode("{\"ads\":[]}"),
+                    content_type: Some("application/json".into()),
+                    ..Default::default()
+                },
+                MapLocal {
+                    pattern: r"^https://a\.test/file".into(),
+                    body_file: Some(map_local_file().to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                MapLocal {
+                    pattern: r"^https://a\.test/gone".into(),
+                    body_file: Some("/nonexistent/map-local.json".into()),
+                    ..Default::default()
+                },
+            ],
             header: vec![HeaderRewrite {
                 pattern: "^https://a\\.test/".into(),
                 action: "add".into(),
@@ -748,6 +781,12 @@ mod tests {
             status(&r, "https://a.test/splash").await,
             (200, "{\"ads\":[]}".into(), None)
         );
+        // From a file, read as it is; a missing one answers 404.
+        assert_eq!(
+            status(&r, "https://a.test/file").await,
+            (200, "GIF89a\0\u{fffd}".into(), None)
+        );
+        assert_eq!(status(&r, "https://a.test/gone").await.0, 404);
         // Passes, with the header added.
         assert_eq!(
             status(&r, "https://a.test/other").await,
