@@ -5,7 +5,10 @@
 use std::{
     cell::RefCell,
     collections::VecDeque,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -38,6 +41,20 @@ pub struct QueryRecord {
 }
 
 static LOG: Mutex<VecDeque<QueryRecord>> = Mutex::new(VecDeque::new());
+/// Off until turned on: nothing is kept.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Turns keeping lookups on or off (off empties the list).
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::Relaxed);
+    if !on {
+        clear();
+    }
+}
+
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
 
 tokio::task_local! {
     /// The client whose answer a lookup used (`batch_exchange`).
@@ -56,6 +73,9 @@ pub(crate) fn record(
     cached: bool,
     started: std::time::Instant,
 ) {
+    if !enabled() {
+        return;
+    }
     let (answers, ttl, result) = match result {
         Ok(m) => {
             let answers = m
@@ -112,6 +132,7 @@ mod tests {
 
     #[tokio::test]
     async fn records_answers_and_the_server() {
+        set_enabled(true);
         let name = rr::Name::from_str("a.example.").unwrap();
         let query = op::Query::query(name.clone(), rr::RecordType::A);
         let mut reply = op::Message::query();
