@@ -75,6 +75,10 @@ pub struct TrackerInfo {
     pub proxy_chain_holder: ProxyChain,
     #[serde(skip)]
     pub session_holder: Session,
+    /// The local process's executable, when a process finder annotates
+    /// connections (our fork); listed as metadata.processPath.
+    #[serde(skip)]
+    pub process_path: Option<String>,
 
     /// Per-user byte counters, separate from `upload_total`/`download_total`.
     /// Only incremented when `session_holder.inbound_user` is set.
@@ -159,6 +163,8 @@ pub struct ClosedFlowInfo {
     pub source_ip: String,
     pub country: Option<String>,
     pub asn: Option<String>,
+    #[serde(rename = "processPath", skip_serializing_if = "Option::is_none")]
+    pub process_path: Option<String>,
 }
 
 impl ClosedFlowInfo {
@@ -185,6 +191,7 @@ impl ClosedFlowInfo {
             source_ip: info.session_holder.source.ip().to_string(),
             country: info.session_holder.country.clone(),
             asn: info.session_holder.asn.clone(),
+            process_path: info.process_path.clone(),
         }
     }
 }
@@ -554,7 +561,14 @@ impl Manager {
                 proxy_chain: chain.clone(),
                 rule: t.rule.clone(),
                 rule_payload: t.rule_payload.clone(),
-                session: t.session_holder.as_map(),
+                session: {
+                    let mut metadata = t.session_holder.as_map();
+                    if let Some(path) = &t.process_path {
+                        metadata
+                            .insert("processPath".into(), Box::new(path.clone()));
+                    }
+                    metadata
+                },
                 ..Default::default()
             });
         }

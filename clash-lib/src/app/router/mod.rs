@@ -28,7 +28,11 @@ use tracing::{error, info, trace};
 pub(crate) mod rules;
 
 use crate::common::{geodata::GeoDataLookup, mmdb::MmdbLookup};
-pub use rules::RuleMatcher;
+pub(crate) use rules::process::process_of;
+pub use rules::{
+    RuleMatcher,
+    process::{ProcessFinder, set_process_finder},
+};
 
 pub struct Router {
     rules: Vec<RuleEntry>,

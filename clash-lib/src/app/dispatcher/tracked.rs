@@ -68,6 +68,7 @@ impl Instrumentation {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let tracker = Arc::new(TrackerInfo {
             uuid,
+            process_path: crate::app::router::process_of(&sess),
             session_holder: sess,
             start_time: chrono::Utc::now(),
             rule: rule
