@@ -29,10 +29,13 @@ pub(crate) async fn handle_inbound_datagram(
     // dispatcher <-> tun communications
     // l_tx: dispatcher write packet responded from remote proxy
     // l_rx: in fut1 items are forwarded to ls
-    let (l_tx, mut l_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
+    // 256, not 32 (our fork): a full queue drops the packet, and a live
+    // stream's bursts filled 32 at once. Packets take memory only while
+    // queued.
+    let (l_tx, mut l_rx) = tokio::sync::mpsc::channel::<UdpPacket>(256);
 
     // forward packets from tun to dispatcher
-    let (d_tx, d_rx) = tokio::sync::mpsc::channel::<UdpPacket>(32);
+    let (d_tx, d_rx) = tokio::sync::mpsc::channel::<UdpPacket>(256);
 
     // for dispatcher - the dispatcher would receive packets from this channel,
     // which is from the stack and send back packets to this channel, which
