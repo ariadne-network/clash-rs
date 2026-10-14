@@ -1,7 +1,9 @@
 use crate::{
     app::{
-        dns::ClashResolver, net::get_interface_by_name,
-        outbound::manager::ThreadSafeOutboundManager, router::ArcRouter,
+        dns::ClashResolver,
+        net::get_interface_by_name,
+        outbound::manager::ThreadSafeOutboundManager,
+        router::{ArcRouter, RuleEntry},
     },
     common::io::copy_bidirectional,
     config::{
@@ -17,7 +19,7 @@ use futures::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
     fmt::{Debug, Formatter},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -291,6 +293,9 @@ impl Dispatcher {
         let s = sess.clone();
         let ss = sess.clone();
         let t1 = tokio::spawn(async move {
+            // Flows' routes (our fork).
+            let mut routes: HashMap<(SocketAddr, SocksAddr), Route<'_>> =
+                HashMap::new();
             while let Some(mut packet) = local_r.next().await {
                 let mut sess = sess.clone();
 
@@ -336,10 +341,49 @@ impl Dispatcher {
 
                 let mode = *mode.read().await;
 
-                let (outbound_name, rule) = match mode {
-                    RunMode::Global => (PROXY_GLOBAL, None),
-                    RunMode::Rule => router.match_route(&mut sess).await,
-                    RunMode::Direct => (PROXY_DIRECT, None),
+                // A flow's route is kept a while (our fork): routing each
+                // packet ran every rule and logged a line per packet, about
+                // 240 a second for a live stream.
+                let now = now_ms();
+                let key = (sess.source, dest.clone());
+                let (outbound_name, rule) = match routes.get(&key) {
+                    Some(r)
+                        if r.mode == std::mem::discriminant(&mode)
+                            && now.saturating_sub(r.at) < ROUTE_KEPT_MS =>
+                    {
+                        sess.resolved_ip = r.resolved_ip;
+                        sess.country = r.country.clone();
+                        sess.asn = r.asn.clone();
+                        (r.target, r.rule)
+                    }
+                    _ => {
+                        let (target, rule) = match mode {
+                            RunMode::Global => (PROXY_GLOBAL, None),
+                            RunMode::Rule => router.match_route(&mut sess).await,
+                            RunMode::Direct => (PROXY_DIRECT, None),
+                        };
+                        if routes.len() >= ROUTES_KEPT {
+                            routes.retain(|_, r| {
+                                now.saturating_sub(r.at) < ROUTE_KEPT_MS
+                            });
+                            if routes.len() >= ROUTES_KEPT {
+                                routes.clear();
+                            }
+                        }
+                        routes.insert(
+                            key,
+                            Route {
+                                at: now,
+                                mode: std::mem::discriminant(&mode),
+                                target,
+                                rule,
+                                resolved_ip: sess.resolved_ip,
+                                country: sess.country.clone(),
+                                asn: sess.asn.clone(),
+                            },
+                        );
+                        (target, rule)
+                    }
                 };
 
                 if let Some(interface) = rule.and_then(|rule| rule.interface()) {
@@ -736,6 +780,22 @@ struct OutboundHandleVal {
     sender: OutboundPacketSender,
     /// `now_ms` when a packet last went either way.
     last_active: Arc<AtomicU64>,
+}
+
+/// How long a UDP flow keeps its route, and how many flows' routes are
+/// kept (our fork).
+const ROUTE_KEPT_MS: u64 = 30_000;
+const ROUTES_KEPT: usize = 1024;
+
+/// A UDP flow's route and what routing found for its session.
+struct Route<'a> {
+    at: u64,
+    mode: std::mem::Discriminant<RunMode>,
+    target: &'a str,
+    rule: Option<&'a RuleEntry>,
+    resolved_ip: Option<IpAddr>,
+    country: Option<String>,
+    asn: Option<String>,
 }
 
 /// Milliseconds since the first call (UDP sessions' activity times).
