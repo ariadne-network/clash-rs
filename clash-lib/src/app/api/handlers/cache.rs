@@ -41,5 +41,6 @@ async fn flush_fakeip(State(state): State<CacheState>) -> impl IntoResponse {
 async fn flush_dns(State(state): State<CacheState>) -> impl IntoResponse {
     let resolver = state.components.read().unwrap().dns_resolver.clone();
     resolver.clear_cache().await;
+    crate::app::dns::query_log::clear();
     StatusCode::NO_CONTENT.into_response()
 }

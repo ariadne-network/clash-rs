@@ -36,7 +36,13 @@ pub fn routes(
     let state = DNSState { components };
     Router::new()
         .route("/query", get(query_dns))
+        .route("/queries", get(recent_queries))
         .with_state(state)
+}
+
+/// The resolver's recent lookups, newest first.
+async fn recent_queries() -> impl IntoResponse {
+    axum::Json(crate::app::dns::query_log::recent())
 }
 
 #[derive(Deserialize)]

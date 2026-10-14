@@ -11,7 +11,7 @@ use crate::{
             IPNetFilter, PendingMmdb,
         },
         helper::make_clients,
-        parse_ip_literal,
+        parse_ip_literal, query_log,
     },
 };
 use anyhow::anyhow;
@@ -340,6 +340,7 @@ impl EnhancedResolver {
                                 "resolve error");
                         })
                         .await
+                        .map(|m| (c.id(), m))
                 }
                 .boxed(),
             )
@@ -349,7 +350,10 @@ impl EnhancedResolver {
 
         tokio::select! {
             result = futures::future::select_ok(queries) => match result {
-                Ok(r) => Ok(r.0),
+                Ok(((id, m), _)) => {
+                    query_log::answered_by(id);
+                    Ok(m)
+                }
                 Err(e) => Err(e),
             },
             _ = timeout => Err(Error::DNSError("DNS query timeout".into()).into())
@@ -400,19 +404,33 @@ impl EnhancedResolver {
                 q = q.to_string(),
                 "cache hit for DNS query, returning cached response",
             );
+            let started = Instant::now();
             let mut reply = build_dns_response_message(message, true, false);
             reply.add_answers(cached.answers.iter().cloned());
-            return Ok(reply);
+            let reply = Ok(reply);
+            query_log::record(q, &reply, String::new(), true, started);
+            return reply;
         }
 
         trace!(q = q.to_string(), "querying resolver");
-        let res = self.exchange_no_cache(message).await.map(|mut r| {
+        let started = Instant::now();
+        let (res, server) = query_log::ANSWERED_BY
+            .scope(Default::default(), async {
+                let res = self.exchange_no_cache(message).await;
+                let server = query_log::ANSWERED_BY
+                    .with(|s| s.borrow_mut().take())
+                    .unwrap_or_default();
+                (res, server)
+            })
+            .await;
+        let res = res.map(|mut r| {
             if let Some(edns) = r.edns.as_mut() {
                 // Remove only padding options, keep everything else
                 edns.options_mut().remove(rr::rdata::opt::EdnsCode::Padding);
             }
             r
         });
+        query_log::record(q, &res, server, false, started);
         trace!(q = q.to_string(), "query completed");
         res
     }

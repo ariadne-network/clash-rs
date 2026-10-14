@@ -14,6 +14,7 @@ mod dns_client;
 mod fakeip;
 mod filters;
 mod helper;
+pub mod query_log;
 pub mod resolver;
 mod rule_dispatch;
 mod runtime;
