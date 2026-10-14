@@ -18,7 +18,10 @@ use std::{
     collections::HashMap,
     fmt::{Debug, Formatter},
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{io::AsyncWriteExt, sync::RwLock, task::JoinHandle};
@@ -417,6 +420,10 @@ impl Dispatcher {
                             tokio::sync::mpsc::channel::<(UdpPacket, SocksAddr)>(
                                 256,
                             );
+                        // When the session last moved a packet, either way
+                        // (our fork: replies alone kept it alive no more).
+                        let last_active = Arc::new(AtomicU64::new(now_ms()));
+                        let active = last_active.clone();
 
                         // Per-session task: owns orig_map and all dst_addr
                         // substitution logic. Outgoing arm rewrites dst_addr
@@ -439,6 +446,7 @@ impl Dispatcher {
                                     // local -> remote
                                     pkt = remote_forwarder.recv() => {
                                         let Some((mut packet, dest)) = pkt else { break };
+                                        active.store(now_ms(), Ordering::Relaxed);
                                         let orig = packet.dst_addr.clone();
                                         packet.dst_addr = dest;
                                         if orig != packet.dst_addr {
@@ -464,6 +472,7 @@ impl Dispatcher {
                                     // remote -> local
                                     pkt = remote_r.next() => {
                                         let Some(mut packet) = pkt else { break };
+                                        active.store(now_ms(), Ordering::Relaxed);
                                         if let Some(orig) =
                                             orig_map.get(&packet.src_addr).cloned()
                                         {
@@ -501,6 +510,7 @@ impl Dispatcher {
                                 packet.src_addr.clone().must_into_socket_addr(),
                                 rw_handle,
                                 remote_sender.clone(),
+                                last_active,
                             )
                             .await;
 
@@ -653,8 +663,9 @@ impl TimeoutUdpSessionManager {
                 let mut alived = 0;
                 let mut expired = 0;
                 g.0.retain(|k, val| {
-                    let now = Instant::now();
-                    let alive = now.duration_since(val.last_active) < timeout;
+                    let idle = now_ms()
+                        .saturating_sub(val.last_active.load(Ordering::Relaxed));
+                    let alive = idle < timeout.as_millis() as u64;
                     if !alive {
                         expired += 1;
                         trace!("udp session expired: {:?}", k);
@@ -684,9 +695,10 @@ impl TimeoutUdpSessionManager {
         src_addr: SocketAddr,
         rw_handle: JoinHandle<()>,
         sender: OutboundPacketSender,
+        last_active: Arc<AtomicU64>,
     ) {
         let mut map = self.map.write().await;
-        map.insert(outbound_name, src_addr, rw_handle, sender);
+        map.insert(outbound_name, src_addr, rw_handle, sender, last_active);
     }
 
     async fn get_outbound_sender_mut(
@@ -711,7 +723,14 @@ struct OutboundHandleVal {
     /// Handles both local→remote and remote→local, owns orig_map.
     rw_handle: JoinHandle<()>,
     sender: OutboundPacketSender,
-    last_active: Instant,
+    /// `now_ms` when a packet last went either way.
+    last_active: Arc<AtomicU64>,
+}
+
+/// Milliseconds since the first call (UDP sessions' activity times).
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 struct OutboundHandleMap(HashMap<OutboundHandleKey, OutboundHandleVal>);
@@ -727,6 +746,7 @@ impl OutboundHandleMap {
         src_addr: SocketAddr,
         rw_handle: JoinHandle<()>,
         sender: OutboundPacketSender,
+        last_active: Arc<AtomicU64>,
     ) {
         self.0.insert(
             OutboundHandleKey {
@@ -736,7 +756,7 @@ impl OutboundHandleMap {
             OutboundHandleVal {
                 rw_handle,
                 sender,
-                last_active: Instant::now(),
+                last_active,
             },
         );
     }
@@ -750,12 +770,21 @@ impl OutboundHandleMap {
             outbound_name: outbound_name.to_owned(),
             src_addr,
         };
+        // A session whose task ended (its socket closed: an error, or the
+        // memory guard) is gone: the packet starts a new one (our fork;
+        // kept, it failed every packet while they kept it from expiring).
+        if self.0.get(&key).is_some_and(|val| val.sender.is_closed()) {
+            if let Some(val) = self.0.remove(&key) {
+                val.rw_handle.abort();
+            }
+            return None;
+        }
         self.0.get_mut(&key).map(|val| {
             trace!(
                 "updating last access time for outbound {:?}",
                 (outbound_name, src_addr)
             );
-            val.last_active = Instant::now();
+            val.last_active.store(now_ms(), Ordering::Relaxed);
             val.sender.clone()
         })
     }
@@ -770,5 +799,37 @@ impl Drop for OutboundHandleMap {
         for (_, val) in self.0.drain() {
             val.rw_handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_closed_udp_session_is_dropped_from_the_map() {
+        let mut map = OutboundHandleMap::new();
+        let src: SocketAddr = "198.18.0.1:5000".parse().unwrap();
+        let (live, _keep) = tokio::sync::mpsc::channel(1);
+        map.insert(
+            "DIRECT",
+            src,
+            tokio::spawn(async {}),
+            live,
+            Arc::new(AtomicU64::new(now_ms())),
+        );
+        assert!(map.get_outbound_sender_mut("DIRECT", src).is_some());
+        // Its task gone: no sender, and no entry left.
+        let (dead, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        map.insert(
+            "DIRECT",
+            src,
+            tokio::spawn(async {}),
+            dead,
+            Arc::new(AtomicU64::new(now_ms())),
+        );
+        assert!(map.get_outbound_sender_mut("DIRECT", src).is_none());
+        assert!(map.0.is_empty());
     }
 }
