@@ -89,6 +89,14 @@ struct LoggingGuard {
 
 static SETUP_LOGGING: Once = Once::new();
 static mut LOGGING_GUARD: Option<LoggingGuard> = None;
+static LOG_TARGETS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Target prefixes (an embedding application's crates) whose events follow
+/// the configured level, as clash's own do; others log warnings only. Call
+/// before the first `setup_logging`.
+pub fn set_log_targets(targets: Vec<String>) {
+    let _ = LOG_TARGETS.set(targets);
+}
 
 pub fn setup_logging(
     level: LogLevel,
@@ -119,7 +127,10 @@ fn setup_logging_inner(
     cwd: &str,
     log_file: Option<String>,
 ) -> anyhow::Result<Option<LoggingGuard>> {
-    let default_log_level = format!("warn,clash={level}");
+    let mut default_log_level = format!("warn,clash={level}");
+    for target in LOG_TARGETS.get().into_iter().flatten() {
+        default_log_level.push_str(&format!(",{target}={level}"));
+    }
     let filter = EnvFilter::try_from_default_env()
         .inspect(|f| {
             eprintln!("using env log level: {f}");
