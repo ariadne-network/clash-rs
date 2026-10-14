@@ -38,8 +38,6 @@ pub struct OutboundDatagramShadowsocks<S> {
     pkt: Option<UdpPacket>,
 
     // for Stream
-    buf: Vec<u8>,
-
     ss_control: UdpSocketControlData,
 }
 
@@ -53,7 +51,6 @@ impl<S> OutboundDatagramShadowsocks<S> {
             flushed: true,
             pkt: None,
             remote_addr,
-            buf: vec![0u8; 65535],
 
             ss_control,
         }
@@ -173,20 +170,23 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        let &mut Self {
-            ref mut buf,
-            ref inner,
-            ..
-        } = self.get_mut();
+        let &mut Self { ref inner, .. } = self.get_mut();
 
-        let mut buf = ReadBuf::new(buf);
-
-        let rv = ready!(inner.poll_recv(cx, &mut buf));
-        debug!("recv udp packet from remote ss server: {:?}", rv);
+        // One buffer per thread (common::utils::with_packet_buffer).
+        let rv = ready!(crate::common::utils::with_packet_buffer(|buf| {
+            let mut buf = ReadBuf::new(buf);
+            inner
+                .poll_recv(cx, &mut buf)
+                .map(|r| r.map(|(n, src, ..)| (buf.filled()[..n].to_vec(), src)))
+        }));
+        debug!(
+            "recv udp packet from remote ss server: {:?}",
+            rv.as_ref().map(|(d, _)| d.len())
+        );
 
         match rv {
-            Ok((n, src, ..)) => Poll::Ready(Some(UdpPacket {
-                data: buf.filled()[..n].to_vec(),
+            Ok((data, src)) => Poll::Ready(Some(UdpPacket {
+                data,
                 src_addr: match src {
                     shadowsocks::relay::Address::SocketAddress(a) => a.into(),
                     _ => SocksAddr::any_ipv4(),

@@ -26,6 +26,23 @@ where
     rand::random_range(range)
 }
 
+thread_local! {
+    static PACKET_BUFFER: std::cell::RefCell<Vec<u8>> =
+        std::cell::RefCell::new(vec![0u8; 65535]);
+}
+
+/// A 64 KiB buffer to receive one datagram into, one per thread rather
+/// than one per UDP session (our fork): the packet is copied out at once,
+/// and a buffer per session cost the iOS extension megabytes with the
+/// hundreds of sessions a live stream opens.
+pub fn with_packet_buffer<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
+    PACKET_BUFFER.with(|b| match b.try_borrow_mut() {
+        Ok(mut buf) => f(&mut buf),
+        // Taken further up this thread's stack: a buffer of its own.
+        Err(_) => f(&mut vec![0u8; 65535]),
+    })
+}
+
 pub fn rand_fill(buf: &mut [u8]) {
     rand::fill(buf)
 }

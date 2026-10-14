@@ -17,7 +17,6 @@ pub struct OutboundDatagramVmess {
     written: Option<usize>,
     flushed: bool,
     pkt: Option<UdpPacket>,
-    buf: Vec<u8>,
 }
 
 impl OutboundDatagramVmess {
@@ -28,7 +27,6 @@ impl OutboundDatagramVmess {
             written: None,
             flushed: true,
             pkt: None,
-            buf: vec![0u8; 65535],
         }
     }
 }
@@ -162,21 +160,25 @@ impl Stream for OutboundDatagramVmess {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let Self {
-            ref mut buf,
             ref mut inner,
             ref remote_addr,
             ..
         } = *self;
 
-        let inner = Pin::new(inner);
+        let mut inner = Pin::new(inner);
 
-        let mut buf = ReadBuf::new(buf);
-
-        let rv = ready!(inner.poll_read(cx, &mut buf));
+        // One buffer per thread (common::utils::with_packet_buffer).
+        let rv = ready!(crate::common::utils::with_packet_buffer(|buf| {
+            let mut buf = ReadBuf::new(buf);
+            inner
+                .as_mut()
+                .poll_read(cx, &mut buf)
+                .map(|r| r.map(|()| buf.filled().to_vec()))
+        }));
 
         match rv {
-            Ok(()) => Poll::Ready(Some(UdpPacket {
-                data: buf.filled().to_vec(),
+            Ok(data) => Poll::Ready(Some(UdpPacket {
+                data,
                 src_addr: remote_addr.clone(),
                 dst_addr: SocksAddr::any_ipv4(),
                 inbound_user: None,
