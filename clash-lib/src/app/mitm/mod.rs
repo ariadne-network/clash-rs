@@ -132,6 +132,10 @@ pub trait HttpProcessor: Send + Sync {
 pub struct Passthrough;
 
 impl HttpProcessor for Passthrough {
+    fn wants(&self, _url: &str) -> bool {
+        false
+    }
+
     fn uses_host(&self, _host: &str, _port: u16) -> bool {
         false
     }
@@ -988,7 +992,7 @@ fn is_upgrade<B>(req: &Request<B>) -> bool {
 /// in order; a bare name is the default port (443 for decryption),
 /// `host:port` another port, `host:0` every port.
 #[derive(Debug, Default)]
-struct HostList(Vec<HostEntry>);
+pub struct HostList(Vec<HostEntry>);
 
 #[derive(Debug)]
 struct HostEntry {
@@ -998,7 +1002,7 @@ struct HostEntry {
 }
 
 impl HostList {
-    fn new(entries: &[String], default_port: u16) -> Self {
+    pub fn new(entries: &[String], default_port: u16) -> Self {
         Self(
             entries
                 .iter()
@@ -1038,7 +1042,7 @@ impl HostList {
             .any(|e| !e.exclude && (e.port == 0 || e.port == port))
     }
 
-    fn matches(&self, host: &str, port: u16) -> bool {
+    pub fn matches(&self, host: &str, port: u16) -> bool {
         let host = host.to_ascii_lowercase();
         self.0
             .iter()
