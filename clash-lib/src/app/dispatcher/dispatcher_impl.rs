@@ -354,7 +354,9 @@ impl Dispatcher {
                 }
                 let outbound_name = outbound_name.to_string();
 
-                debug!("dispatching {} to {}[{}]", sess, outbound_name, mode);
+                // Per packet (our fork: trace, not debug; a live stream logged
+                // thousands a second).
+                trace!("dispatching {} to {}[{}]", sess, outbound_name, mode);
 
                 let remote_receiver_w = remote_receiver_w.clone();
 
@@ -393,7 +395,10 @@ impl Dispatcher {
                     .await
                 {
                     None => {
-                        debug!("building {} outbound datagram connecting", sess);
+                        debug!(
+                            "building {} outbound datagram to {}[{}]",
+                            sess, outbound_name, mode
+                        );
                         let mut outbound_datagram = match handler
                             .connect_datagram(&sess, resolver.clone())
                             .await
@@ -485,9 +490,15 @@ impl Dispatcher {
                                             }
                                         }
                                         packet.dst_addr = sess.source.into();
-                                        debug!(
-                                            "UDP NAT for packet: {:?}, session: {}",
-                                            packet, sess
+                                        // Per packet, without its bytes (our
+                                        // fork: a 1200-byte packet made a 5 KB
+                                        // debug line).
+                                        trace!(
+                                            "UDP NAT for a packet from {} ({} \
+                                             bytes), session: {}",
+                                            packet.src_addr,
+                                            packet.data.len(),
+                                            sess
                                         );
                                         match remote_receiver_w.send(packet).await {
                                             Ok(_) => {}
@@ -525,7 +536,7 @@ impl Dispatcher {
                         match sender.send((packet, dest)).await {
                             // TODO: need to reset when GLOBAL select is changed
                             Ok(_) => {
-                                debug!("reusing {} sent to remote", sess);
+                                trace!("reusing {} sent to remote", sess);
                             }
                             Err(err) => {
                                 error!("failed to send packet to remote: {}", err);

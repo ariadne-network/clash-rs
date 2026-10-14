@@ -153,7 +153,10 @@ fn setup_logging_inner(
         let writer = std::fs::File::options().append(true).open(log_path)?;
         let (non_blocking, guard) =
             tracing_appender::non_blocking::NonBlockingBuilder::default()
-                .buffered_lines_limit(16_000)
+                // Lines waiting for the file take memory: 2000 at most
+                // (our fork; 16000 of long debug lines took megabytes in the
+                // iOS extension). Past it lines are dropped (lossy).
+                .buffered_lines_limit(2_000)
                 .lossy(true)
                 .thread_name("clash-logger-appender")
                 .finish(writer);
