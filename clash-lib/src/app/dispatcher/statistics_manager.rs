@@ -222,6 +222,9 @@ pub struct Manager {
     mem_hard_ratio_x100: AtomicU64,
     /// Cached memory usage in bytes, periodically refreshed by `kick_off`.
     mem_usage_cached: AtomicU64,
+    /// Each connection's bytes at the last hard-mode check: what it moved
+    /// since tells the idle from the active (our fork).
+    last_totals: std::sync::Mutex<HashMap<uuid::Uuid, u64>>,
     /// Indicates whether the background stats loop is active.
     running: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -319,6 +322,7 @@ impl Manager {
             dns_resolver: RwLock::new(None),
             mem_hard_ratio_x100: AtomicU64::new(hard_ratio_x100),
             mem_usage_cached: AtomicU64::new(0),
+            last_totals: std::sync::Mutex::new(HashMap::new()),
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         });
         let c = v.clone();
@@ -741,12 +745,14 @@ impl Manager {
                         return;
                     }
 
-                    // Smart eviction: prioritize closing connections that are
-                    // (a) UDP (cheaper to reconnect — P2P/QUIC retransmit)
-                    // (b) idle (lowest total bytes transferred)
-                    // This avoids killing active TCP streams (SSH, video,
-                    // downloads).
-                    let mut candidates: Vec<(uuid::Uuid, u64, bool)> = connections
+                    // Smart eviction (our fork): the connections that moved
+                    // the fewest bytes since the last check are idle and go
+                    // first, whatever their protocol. Upstream closed UDP
+                    // first: a live stream's active flows went before idle
+                    // TCP connections, came back at once and went again.
+                    let mut last_totals = self.last_totals.lock().unwrap();
+                    let mut totals = HashMap::with_capacity(connections.len());
+                    let mut candidates: Vec<(uuid::Uuid, u64)> = connections
                         .iter()
                         .filter(|(_, (_, close_notify_opt))| {
                             close_notify_opt.is_some()
@@ -755,19 +761,16 @@ impl Manager {
                             let info = tracked.tracker_info();
                             let bytes = info.upload_total.load(Ordering::Relaxed)
                                 + info.download_total.load(Ordering::Relaxed);
-                            let is_udp = info.session_holder.network
-                                == crate::session::Network::Udp;
-                            (*id, bytes, is_udp)
+                            totals.insert(*id, bytes);
+                            let recent = bytes.saturating_sub(
+                                last_totals.get(id).copied().unwrap_or(0),
+                            );
+                            (*id, recent)
                         })
                         .collect();
-                    // Sort: UDP first (evict before TCP), then by ascending
-                    // bytes (idle before active).  Stable
-                    // sort keeps insertion order
-                    // for ties (older connections evicted first).
-                    candidates.sort_by(|a, b| {
-                        // UDP (true) sorts before TCP (false)
-                        b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1))
-                    });
+                    *last_totals = totals;
+                    drop(last_totals);
+                    candidates.sort_by_key(|c| c.1);
 
                     // Close only the bottom 20% (not 50%) to keep network
                     // partially up — gives the system room to recover.
