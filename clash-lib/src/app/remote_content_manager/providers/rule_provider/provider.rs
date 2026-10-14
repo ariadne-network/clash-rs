@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    fmt::Display,
-    net::{IpAddr, Ipv4Addr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use erased_serde::Serialize as ESerialize;
@@ -23,8 +17,7 @@ use crate::{
         router::{RuleMatcher, map_rule_type},
     },
     common::{
-        errors::map_io_error, geodata::GeoDataLookup, mmdb::MmdbLookup,
-        succinct_set, trie,
+        errors::map_io_error, geodata::GeoDataLookup, mmdb::MmdbLookup, succinct_set,
     },
     config::internal::rule::{RuleKind, RuleType},
     session::Session,
@@ -82,8 +75,20 @@ pub enum RuleContent {
     Classical(Box<FastClassicalRules>),
 }
 
+/// The API lists this many of a set's rules; only they are kept as text
+/// (our fork: all were, about 50 bytes each).
+const LISTED_RULES: usize = 500;
+
 pub struct FastClassicalRules {
+    /// It has IP rules that look a name up (our fork).
+    resolves_ip: bool,
     raw_rules: Vec<String>,
+    /// DOMAIN and DOMAIN-SUFFIX rules as a domain set (our fork): in a
+    /// hash set and a radix trie they took about 300 bytes each, so a list
+    /// of 100,000 left little of an iOS packet tunnel's 50 MiB. Those with
+    /// wildcard characters, which the set reads as wildcards, stay in the
+    /// two below.
+    domains: succinct_set::DomainSet,
     exact_domains: std::collections::HashSet<String>,
     domain_suffix_trie: crate::common::domain_trie::DomainSuffixTrie<()>,
     domain_keywords_ac: Option<aho_corasick::AhoCorasick>,
@@ -100,7 +105,9 @@ impl Default for FastClassicalRules {
 impl FastClassicalRules {
     pub fn empty() -> Self {
         Self {
+            resolves_ip: false,
             raw_rules: Vec::new(),
+            domains: succinct_set::DomainSet::default(),
             exact_domains: std::collections::HashSet::new(),
             domain_suffix_trie: crate::common::domain_trie::DomainSuffixTrie::new(),
             domain_keywords_ac: None,
@@ -111,6 +118,9 @@ impl FastClassicalRules {
 
     pub fn search(&self, sess: &Session) -> bool {
         if let Some(domain) = sess.destination.domain() {
+            if self.domains.has(domain) {
+                return true;
+            }
             let domain_lower = domain.to_ascii_lowercase();
             if self.exact_domains.contains(&domain_lower) {
                 return true;
@@ -152,6 +162,11 @@ struct Inner {
 #[async_trait]
 pub trait RuleProvider: Provider {
     fn search(&self, sess: &Session) -> bool;
+    /// Whether a name is looked up before searching (our fork): for IP
+    /// rules.
+    fn should_resolve_ip(&self) -> bool {
+        false
+    }
     fn behavior(&self) -> RuleSetBehavior;
     fn format(&self) -> RuleSetFormat;
     /// Returns up to `limit` rules as strings. Only Classical providers return
@@ -263,16 +278,31 @@ impl RuleProviderImpl {
                             ))
                         })?;
 
-                        let mut payload: Vec<String> = text
-                            .lines()
-                            .map(str::trim)
-                            .filter(|line| {
-                                !line.is_empty()
-                                    && !line.starts_with('#')
-                                    && !line.starts_with("//")
-                            })
-                            .map(String::from)
-                            .collect();
+                        let lines = text.lines().map(str::trim).filter(|line| {
+                            !line.is_empty()
+                                && !line.starts_with('#')
+                                && !line.starts_with("//")
+                        });
+                        // A domain set straight from the lines (our fork),
+                        // not through a string for each of them.
+                        if matches!(current_behavior, RuleSetBehavior::Domain) {
+                            return Ok(RuleContent::Domain(
+                                match inline_rules_clone.as_deref() {
+                                    None | Some([]) => {
+                                        succinct_set::DomainSet::from_lines(text)
+                                    }
+                                    Some(inline) => {
+                                        succinct_set::DomainSet::from_rules(
+                                            lines.chain(
+                                                inline.iter().map(String::as_str),
+                                            ),
+                                        )
+                                    }
+                                },
+                            ));
+                        }
+                        let mut payload: Vec<String> =
+                            lines.map(String::from).collect();
 
                         if let Some(inline) = inline_rules_clone.clone() {
                             payload.extend(inline);
@@ -339,17 +369,34 @@ impl RuleProvider for RuleProviderImpl {
         match inner {
             Ok(inner) => match &inner.content {
                 RuleContent::Domain(set) => set.has(&sess.destination.host()),
-                RuleContent::Ipcidr(trie) => trie.contains(
-                    sess.destination
-                        .ip()
-                        .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))),
-                ),
+                // The address looked up for a name too (our fork), and no
+                // match without one: 0.0.0.0 matched sets with 0.0.0.0/8.
+                RuleContent::Ipcidr(trie) => sess
+                    .resolved_ip
+                    .or(sess.destination.ip())
+                    .is_some_and(|ip| trie.contains(ip)),
                 RuleContent::Classical(fast) => fast.search(sess),
             },
             Err(_) => {
                 debug!("rule provider {} is busy", self.name());
                 false
             }
+        }
+    }
+
+    fn should_resolve_ip(&self) -> bool {
+        match self.behavior {
+            RuleSetBehavior::Domain => false,
+            RuleSetBehavior::Ipcidr => true,
+            // While the content is being replaced: looking up costs a
+            // query at most.
+            RuleSetBehavior::Classical => match self.inner.try_read() {
+                Ok(inner) => match &inner.content {
+                    RuleContent::Classical(fast) => fast.resolves_ip,
+                    _ => false,
+                },
+                Err(_) => true,
+            },
         }
     }
 
@@ -480,10 +527,9 @@ fn make_rules(
     geodata: Option<GeoDataLookup>,
 ) -> Result<RuleContent, Error> {
     match behavior {
-        RuleSetBehavior::Domain => {
-            let s = make_domain_rules(rules)?;
-            Ok(RuleContent::Domain(s.into()))
-        }
+        RuleSetBehavior::Domain => Ok(RuleContent::Domain(
+            succinct_set::DomainSet::from_rules(rules.iter().map(String::as_str)),
+        )),
         RuleSetBehavior::Ipcidr => {
             Ok(RuleContent::Ipcidr(Box::new(make_ip_cidr_rules(rules)?)))
         }
@@ -491,14 +537,6 @@ fn make_rules(
             make_classical_rules(rules, mmdb, geodata)?,
         ))),
     }
-}
-
-fn make_domain_rules(rules: Vec<String>) -> Result<trie::StringTrie<bool>, Error> {
-    let mut trie = trie::StringTrie::new();
-    for rule in rules {
-        trie.insert(&rule, Arc::new(true));
-    }
-    Ok(trie)
 }
 
 fn make_ip_cidr_rules(rules: Vec<String>) -> Result<CidrTrie, Error> {
@@ -520,6 +558,10 @@ fn make_classical_rules(
     let mut keywords = Vec::new();
     let mut ip_cidr = CidrTrie::new();
     let mut other_rules = Vec::new();
+    let mut resolves_ip = false;
+    // The domain set's rules, a line each.
+    let mut names = String::new();
+    let plain = |name: &str| !name.is_empty() && !name.contains(['*', '+', '\n']);
 
     for rule in rules {
         let parts = rule.split(',').map(str::trim).collect::<Vec<&str>>();
@@ -537,38 +579,59 @@ fn make_classical_rules(
 
         let options = rule_type.options();
         match rule_type.kind() {
+            RuleKind::Domain { domain, .. } if plain(domain) => {
+                names.push_str(domain);
+                names.push('\n');
+            }
             RuleKind::Domain { domain, .. } => {
                 exact_domains.insert(domain.to_ascii_lowercase());
             }
             RuleKind::DomainSuffix { domain_suffix, .. } => {
-                domain_suffix_trie.insert(domain_suffix, ());
+                // As the trie takes it: without dots around.
+                let suffix = domain_suffix
+                    .trim()
+                    .trim_start_matches('.')
+                    .trim_end_matches('.');
+                if plain(suffix) {
+                    names.push_str("+.");
+                    names.push_str(suffix);
+                    names.push('\n');
+                } else {
+                    domain_suffix_trie.insert(domain_suffix, ());
+                }
             }
             RuleKind::DomainKeyword { domain_keyword, .. } => {
                 keywords.push(domain_keyword.clone());
             }
             RuleKind::IpCidr { ipnet, .. } if !options.no_resolve => {
                 ip_cidr.insert(&ipnet.to_string());
+                resolves_ip = true;
             }
             _ => {
                 let rule_matcher =
                     map_rule_type(rule_type, mmdb.clone(), geodata.clone(), None);
-                raw_rules.push(format!(
-                    "{},{}",
-                    rule_matcher.type_name(),
-                    rule_matcher.payload()
-                ));
+                resolves_ip |= rule_matcher.should_resolve_ip();
+                if raw_rules.len() < LISTED_RULES {
+                    raw_rules.push(format!(
+                        "{},{}",
+                        rule_matcher.type_name(),
+                        rule_matcher.payload()
+                    ));
+                }
                 other_rules.push(rule_matcher);
                 continue;
             }
         }
 
-        let rule_matcher =
-            map_rule_type(rule_type, mmdb.clone(), geodata.clone(), None);
-        raw_rules.push(format!(
-            "{},{}",
-            rule_matcher.type_name(),
-            rule_matcher.payload()
-        ));
+        if raw_rules.len() < LISTED_RULES {
+            let rule_matcher =
+                map_rule_type(rule_type, mmdb.clone(), geodata.clone(), None);
+            raw_rules.push(format!(
+                "{},{}",
+                rule_matcher.type_name(),
+                rule_matcher.payload()
+            ));
+        }
     }
 
     let domain_keywords_ac = if !keywords.is_empty() {
@@ -581,7 +644,9 @@ fn make_classical_rules(
     };
 
     Ok(FastClassicalRules {
+        resolves_ip,
         raw_rules,
+        domains: succinct_set::DomainSet::from_rules(names.lines()),
         exact_domains,
         domain_suffix_trie,
         domain_keywords_ac,
@@ -629,6 +694,86 @@ mod tests {
             ..Default::default()
         };
         assert!(provider.search(&sess));
+    }
+
+    #[tokio::test]
+    async fn classical_domains_in_a_domain_set() {
+        let provider = RuleProviderImpl::new(
+            "test".to_string(),
+            RuleSetBehavior::Classical,
+            RuleSetFormat::Text,
+            None,
+            None,
+            Some(Arc::new(MockMmdbLookupTrait::new())),
+            Some(Arc::new(MockGeoDataLookupTrait::new())),
+            Some(
+                [
+                    "DOMAIN,Exact.example",
+                    "DOMAIN-SUFFIX,.suffix.example",
+                    "DOMAIN-SUFFIX,*.wild.example",
+                    "DOMAIN,a*.star.example",
+                    "DOMAIN-KEYWORD,keyword",
+                ]
+                .iter()
+                .map(|r| r.to_string())
+                .collect(),
+            ),
+        );
+        assert_ok!(provider.initialize().await);
+        let matches = |host: &str| {
+            provider.search(&Session {
+                destination: SocksAddr::Domain(host.to_owned(), 443),
+                ..Default::default()
+            })
+        };
+        assert!(matches("exact.example") && !matches("www.exact.example"));
+        assert!(matches("suffix.example") && matches("a.b.SUFFIX.example"));
+        assert!(!matches("notsuffix.example"));
+        // Wildcard characters as the trie and hash set take them: literally.
+        assert!(matches("x.*.wild.example") && !matches("x.y.wild.example"));
+        assert!(matches("a*.star.example") && !matches("ab.star.example"));
+        assert!(matches("a.keyword.example"));
+        assert!(!provider.list_rules(10).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rule_sets_with_ip_rules_look_names_up() {
+        let provider = |behavior, rules: &[&str]| {
+            RuleProviderImpl::new(
+                "test".to_string(),
+                behavior,
+                RuleSetFormat::Text,
+                None,
+                None,
+                Some(Arc::new(MockMmdbLookupTrait::new())),
+                Some(Arc::new(MockGeoDataLookupTrait::new())),
+                Some(rules.iter().map(|r| r.to_string()).collect()),
+            )
+        };
+        let classical = provider(
+            RuleSetBehavior::Classical,
+            &["DOMAIN-SUFFIX,google.com", "IP-CIDR,1.2.3.0/24"],
+        );
+        assert_ok!(classical.initialize().await);
+        assert!(classical.should_resolve_ip());
+        let names = provider(
+            RuleSetBehavior::Classical,
+            &["DOMAIN-SUFFIX,google.com", "IP-CIDR,1.2.3.0/24,no-resolve"],
+        );
+        assert_ok!(names.initialize().await);
+        assert!(!names.should_resolve_ip());
+        // An IP range set matches the address looked up for a name, and
+        // nothing without one.
+        let ranges = provider(RuleSetBehavior::Ipcidr, &["1.2.3.0/24", "0.0.0.0/8"]);
+        assert_ok!(ranges.initialize().await);
+        assert!(ranges.should_resolve_ip());
+        let mut sess = Session {
+            destination: SocksAddr::Domain("example.com".to_owned(), 443),
+            ..Default::default()
+        };
+        assert!(!ranges.search(&sess));
+        sess.resolved_ip = Some("1.2.3.4".parse().unwrap());
+        assert!(ranges.search(&sess));
     }
 
     #[tokio::test]

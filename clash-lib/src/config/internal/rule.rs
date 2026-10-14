@@ -402,12 +402,15 @@ impl RuleType {
             ))),
         }?;
 
+        // RULE-SET too (our fork, as mihomo): the set's IP rules then go
+        // by the destination's address alone.
         if options.no_resolve
             && !matches!(
                 &kind,
                 RuleKind::GeoIP { .. }
                     | RuleKind::IpCidr { .. }
                     | RuleKind::SrcCidr { .. }
+                    | RuleKind::RuleSet { .. }
             )
         {
             return Err(Error::InvalidConfig(format!(
@@ -546,6 +549,10 @@ mod tests {
                 "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve,interface=en0".to_string()
             )
             .is_ok()
+        );
+        // Our fork: a rule set's IP rules without a lookup.
+        assert!(
+            RuleType::try_from("RULE-SET,cn,DIRECT,no-resolve".to_string()).is_ok()
         );
     }
 

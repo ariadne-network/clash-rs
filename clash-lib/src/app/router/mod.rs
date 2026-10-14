@@ -467,6 +467,7 @@ pub fn map_rule_type(
                         print_and_exit!("rule provider {} not found", rule_set)
                     })
                     .clone(),
+                options.no_resolve,
             )),
             None => {
                 // this is called in remote rule provider with no rule provider

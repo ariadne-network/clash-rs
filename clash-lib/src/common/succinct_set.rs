@@ -2,7 +2,7 @@
 //! impl: https://github.com/MetaCubeX/mihomo/blob/Meta/component/trie/domain_set.go
 //! I have no idea what's going on here, just copy the code from above link.
 
-use super::trie::StringTrie;
+use super::trie::{StringTrie, valid_and_split_domain};
 
 static COMPLEX_WILDCARD: u8 = b'+';
 static WILDCARD: u8 = b'*';
@@ -263,59 +263,131 @@ impl DomainSet {
 }
 
 struct QElt {
-    s: usize,
-    e: usize,
-    col: usize,
+    s: u32,
+    e: u32,
+    col: u32,
 }
 
-/// Convert a `StringTrie` to a `DomainSet`.
-/// TODO: support loading from a binary file.
-/// e.g. the so called 'mrs' file in the MiHoMo project.
-impl<T> From<StringTrie<T>> for DomainSet {
-    fn from(value: StringTrie<T>) -> Self {
-        let mut keys = vec![];
-        value.traverse(|key, _| {
-            keys.push(key.chars().rev().collect::<String>());
-            true
-        });
-        keys.sort();
+impl DomainSet {
+    /// A set of domain rules ("example.com", "+.example.com" for it and its
+    /// subdomains, ".example.com" for subdomains alone, "*" for one label),
+    /// as `StringTrie` takes them, built without one (our fork): the trie of
+    /// a list of 250,000 names took tens of MiB to build a set of four, and
+    /// iOS ends a packet tunnel at about 50 MiB.
+    pub fn from_rules<'a>(rules: impl IntoIterator<Item = &'a str>) -> Self {
+        Self::build(rules, 0, 0)
+    }
 
+    /// The set of a list's lines. Its size sets aside what the build takes
+    /// at once, which growing piecemeal left behind in the allocator.
+    pub fn from_lines(text: &str) -> Self {
+        let lines = text.bytes().filter(|b| *b == b'\n').count() + 1;
+        Self::build(
+            text.lines().map(str::trim).filter(|line| {
+                !line.is_empty() && !line.starts_with('#') && !line.starts_with("//")
+            }),
+            text.len() * 2,
+            lines * 2,
+        )
+    }
+
+    fn build<'a>(
+        rules: impl IntoIterator<Item = &'a str>,
+        bytes_capacity: usize,
+        keys_capacity: usize,
+    ) -> Self {
+        // The keys one after another, reversed, a byte per character in
+        // lowercase as `has` reads them, with each one's start and length.
+        let mut bytes: Vec<u8> = Vec::with_capacity(bytes_capacity);
+        let mut spans: Vec<(u32, u32)> = Vec::with_capacity(keys_capacity);
+        let mut add = |prefix: &str, name: &str| {
+            let start = bytes.len();
+            bytes.extend(
+                name.chars()
+                    .rev()
+                    .chain(prefix.chars().rev())
+                    .map(|c| c.to_ascii_lowercase() as u8),
+            );
+            spans.push((start as u32, (bytes.len() - start) as u32));
+        };
+        for rule in rules {
+            let (Some(parts), true) = valid_and_split_domain(rule) else {
+                continue;
+            };
+            match parts[0] {
+                "+" if parts.len() > 1 => {
+                    add("", &rule[2..]);
+                    add("+.", &rule[2..]);
+                }
+                "+" => {}
+                "" => add("+", rule),
+                _ => add("", rule),
+            }
+        }
+        let key = |&(start, len): &(u32, u32)| {
+            &bytes[start as usize..start as usize + len as usize]
+        };
+        spans.sort_unstable_by(|a, b| key(a).cmp(key(b)));
+        spans.dedup_by(|a, b| key(a) == key(b));
+        Self::from_sorted(spans.len(), |i| key(&spans[i]))
+    }
+
+    /// The set of `len` keys, reversed, sorted and without duplicates.
+    /// Nodes are numbered breadth first; the queue holds one level at a
+    /// time (our fork: it kept an entry for every node, one per character
+    /// of all keys).
+    fn from_sorted<'a>(len: usize, key: impl Fn(usize) -> &'a [u8]) -> Self {
         let mut rv = DomainSet::default();
-
+        if len == 0 {
+            return rv;
+        }
+        // A label for each character that follows a key's longest common
+        // prefix with the one before it, and a node for each label and the
+        // root: the sizes, to allocate once.
+        let labels = (0..len)
+            .map(|i| {
+                let k = key(i);
+                let common = match i {
+                    0 => 0,
+                    _ => {
+                        k.iter().zip(key(i - 1)).take_while(|(a, b)| a == b).count()
+                    }
+                };
+                k.len() - common
+            })
+            .sum::<usize>();
+        rv.labels.reserve_exact(labels);
+        rv.label_bit_map
+            .reserve_exact((2 * labels + 1).div_ceil(64) + 1);
+        rv.leaves.reserve_exact((labels + 1).div_ceil(64) + 1);
+        let at = |i: u32, col: u32| key(i as usize).get(col as usize).copied();
         let mut l_idx = 0;
-
-        let mut queue = vec![QElt {
+        let mut queue = std::collections::VecDeque::from([QElt {
             s: 0,
-            e: keys.len(),
+            e: len as u32,
             col: 0,
-        }];
-
+        }]);
         let mut i = 0;
-        loop {
-            let elt = &mut queue[i];
-            if elt.col == keys[elt.s].len() {
+        while let Some(mut elt) = queue.pop_front() {
+            if elt.col as usize == key(elt.s as usize).len() {
                 elt.s += 1;
                 set_bit(&mut rv.leaves, i, true);
             }
 
             let mut j = elt.s;
-            let e = elt.e;
-            let col = elt.col;
-            while j < e {
+            while j < elt.e {
                 let frm = j;
-                while j < e && keys[j].chars().nth(col) == keys[frm].chars().nth(col)
-                {
+                while j < elt.e && at(j, elt.col) == at(frm, elt.col) {
                     j += 1;
                 }
 
-                queue.push(QElt {
+                queue.push_back(QElt {
                     s: frm,
                     e: j,
-                    col: col + 1,
+                    col: elt.col + 1,
                 });
-                // Safely handle potential None if keys[frm] is shorter than col
-                if let Some(char_at_col) = keys[frm].chars().nth(col) {
-                    rv.labels.push(char_at_col as u8);
+                if let Some(c) = at(frm, elt.col) {
+                    rv.labels.push(c);
                     set_bit(&mut rv.label_bit_map, l_idx, false);
                     l_idx += 1;
                 }
@@ -323,16 +395,25 @@ impl<T> From<StringTrie<T>> for DomainSet {
 
             set_bit(&mut rv.label_bit_map, l_idx, true);
             l_idx += 1;
-
-            if i == queue.len() - 1 {
-                break;
-            }
             i += 1;
         }
 
         rv.init();
-
         rv
+    }
+}
+
+/// Convert a `StringTrie` to a `DomainSet`.
+impl<T> From<StringTrie<T>> for DomainSet {
+    fn from(value: StringTrie<T>) -> Self {
+        let mut keys = vec![];
+        value.traverse(|key, _| {
+            keys.push(key.chars().rev().map(|c| c as u8).collect::<Vec<u8>>());
+            true
+        });
+        keys.sort();
+        keys.dedup();
+        Self::from_sorted(keys.len(), |i| &keys[i])
     }
 }
 
@@ -454,6 +535,46 @@ mod tests {
         assert!(!set.has("test.test.test.qq.com"));
 
         test_dump(&key_src, &set);
+    }
+
+    #[test]
+    fn from_rules_as_through_the_trie() {
+        let rules = [
+            "baidu.com",
+            "google.com",
+            "www.google.com",
+            ".qq.com",
+            "+.cn",
+            "+.example.org",
+            "example.org",
+            "*.*.qq.com",
+            "stun.*.*",
+            "www.baidu.*",
+            "bad..name",
+            "trailing.dot.",
+            "",
+        ];
+        let mut tree = super::StringTrie::new();
+        for d in rules {
+            tree.insert(d, Arc::new(true));
+        }
+        let mut via_trie = vec![];
+        super::DomainSet::from(tree).traverse(|key| {
+            via_trie.push(key.to_owned());
+            true
+        });
+        let mut direct = vec![];
+        let set = super::DomainSet::from_rules(rules);
+        set.traverse(|key| {
+            direct.push(key.to_owned());
+            true
+        });
+        assert_eq!(direct, via_trie);
+        assert!(set.has("test.cn") && set.has("cn") && set.has("www.qq.com"));
+        assert!(!set.has("qq.com") && !set.has("bad..name"));
+        // Names in capitals match, as lookups are in lowercase.
+        assert!(super::DomainSet::from_rules(["Example.COM"]).has("example.com"));
+        assert!(!super::DomainSet::from_rules([]).has("example.com"));
     }
 
     fn test_dump(data_src: &Vec<String>, set: &super::DomainSet) {
