@@ -36,6 +36,27 @@ use crate::{app::dispatcher::BoxedInstrumentedStream, proxy::ProxyStream};
 /// not interrupted; we yield between cycles, not mid-write.
 const YIELD_EVERY_BYTES: u64 = 256 * 1024;
 
+/// A relayed TCP connection that carries nothing either way for this long
+/// is closed; 0 never closes it (our fork; `experimental.tcp-idle-timeout`).
+/// Connections that stay open on purpose, idle between rare messages (the
+/// push service of Apple devices, chat apps, SSH), were closed every minute
+/// and opened again.
+static TCP_IDLE_TIMEOUT_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_TCP_IDLE_TIMEOUT_SECS);
+pub const DEFAULT_TCP_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// Sets the idle timeout of relayed TCP connections; 0 for none.
+pub fn set_tcp_idle_timeout(secs: u64) {
+    TCP_IDLE_TIMEOUT_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn tcp_idle_timeout() -> Option<Duration> {
+    match TCP_IDLE_TIMEOUT_SECS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
+}
+
 #[derive(Debug)]
 pub enum CopyBidirectionalError {
     LeftClosed(std::io::Error),
@@ -277,8 +298,8 @@ struct CopyBidirectional<'a, A: ?Sized, B: ?Sized> {
     b_to_a_delay: Option<Pin<Box<tokio::time::Sleep>>>,
     a_to_b_timeout_duration: Duration,
     b_to_a_timeout_duration: Duration,
-    idle_timeout: Pin<Box<tokio::time::Sleep>>,
-    idle_timeout_duration: Duration,
+    idle_timeout: Option<Pin<Box<tokio::time::Sleep>>>,
+    idle_timeout_duration: Option<Duration>,
 }
 
 impl<A, B> Future for CopyBidirectional<'_, A, B>
@@ -309,7 +330,10 @@ where
         let mut b = Pin::new(b);
 
         // Check idle timeout - if expired, force both directions to shutdown
-        if idle_timeout.as_mut().poll(cx).is_ready() {
+        if idle_timeout
+            .as_mut()
+            .is_some_and(|timeout| timeout.as_mut().poll(cx).is_ready())
+        {
             if !matches!(a_to_b, TransferState::Done) {
                 let count = match a_to_b {
                     TransferState::Running(buf) => buf.amount_transferred(),
@@ -335,8 +359,8 @@ where
                         cx,
                         a.as_mut(),
                         b.as_mut(),
-                        Some(idle_timeout),
-                        Some(*idle_timeout_duration),
+                        idle_timeout.as_mut(),
+                        *idle_timeout_duration,
                     );
                     match res {
                         Poll::Ready(Ok(count)) => {
@@ -391,8 +415,8 @@ where
                         cx,
                         b.as_mut(),
                         a.as_mut(),
-                        Some(idle_timeout),
-                        Some(*idle_timeout_duration),
+                        idle_timeout.as_mut(),
+                        *idle_timeout_duration,
                     );
                     match res {
                         Poll::Ready(Ok(count)) => {
@@ -521,7 +545,29 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    let idle_timeout_duration = Duration::from_secs(60);
+    copy_with_idle_timeout(
+        a,
+        b,
+        size,
+        a_to_b_timeout_duration,
+        b_to_a_timeout_duration,
+        tcp_idle_timeout(),
+    )
+    .await
+}
+
+async fn copy_with_idle_timeout<A, B>(
+    a: &mut A,
+    b: &mut B,
+    size: usize,
+    a_to_b_timeout_duration: Duration,
+    b_to_a_timeout_duration: Duration,
+    idle_timeout_duration: Option<Duration>,
+) -> Result<(u64, u64), CopyBidirectionalError>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
     CopyBidirectional {
         a,
         b,
@@ -533,7 +579,8 @@ where
         b_to_a_delay: None,
         a_to_b_timeout_duration,
         b_to_a_timeout_duration,
-        idle_timeout: Box::pin(tokio::time::sleep(idle_timeout_duration)),
+        idle_timeout: idle_timeout_duration
+            .map(|duration| Box::pin(tokio::time::sleep(duration))),
         idle_timeout_duration,
     }
     .await
@@ -663,5 +710,37 @@ mod tests {
         assert_eq!(a_to_b, data.len() as u64);
         assert_eq!(b_to_a, 0);
         assert_eq!(received, data);
+    }
+
+    /// A connection quiet past the idle timeout closes; without one it
+    /// stays open, and still carries data.
+    #[tokio::test]
+    async fn idle_connections_close_only_with_an_idle_timeout() {
+        for idle in [Some(Duration::from_secs(1)), None] {
+            let (mut client, mut server_io) = duplex(1024);
+            let (mut proxy_client, mut remote) = duplex(1024);
+            let copy = tokio::spawn(async move {
+                copy_with_idle_timeout(
+                    &mut server_io,
+                    &mut proxy_client,
+                    1024,
+                    Duration::from_secs(10),
+                    Duration::from_secs(10),
+                    idle,
+                )
+                .await
+            });
+            client.write_all(b"connect").await.unwrap();
+            let mut buf = [0u8; 7];
+            remote.read_exact(&mut buf).await.unwrap();
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(copy.is_finished(), idle.is_some(), "{idle:?}");
+            if idle.is_none() {
+                remote.write_all(b"message").await.unwrap();
+                client.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"message");
+            }
+        }
     }
 }

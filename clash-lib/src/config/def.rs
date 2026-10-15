@@ -872,6 +872,10 @@ pub struct Experimental {
     /// CLASH_RS_MEM_LIMIT_MB with `:hard`).
     pub memory_limit_mb: Option<u64>,
     pub memory_hard_ratio: Option<f64>,
+    /// Seconds a relayed TCP connection may carry nothing before it is
+    /// closed (default 60); 0 never closes it (our fork). Without a
+    /// timeout, ended connections are still found by keep-alives.
+    pub tcp_idle_timeout: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
