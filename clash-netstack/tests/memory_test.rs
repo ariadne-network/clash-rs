@@ -10,7 +10,7 @@ use std::{collections::HashMap, time::Duration};
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
-use watfaq_netstack::{NetStack, Packet};
+use watfaq_netstack::{NetStack, Packet, TCP_SEND_BUFFERING};
 
 #[allow(dead_code)]
 mod common;
@@ -23,6 +23,13 @@ use common::{
 use mock_tun::MockTun;
 
 const CONNECTIONS: u16 = 64;
+
+/// The tests measure the whole process: one at a time.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 const DOWNLOAD: usize = 512 * 1024;
 
 fn footprint() -> i64 {
@@ -43,6 +50,10 @@ fn footprint() -> i64 {
 
 /// An ACK from the client 1.1.1.1:`port` to 2.2.2.2:80.
 fn ack(port: u16, seq: u32, ack: u32) -> Bytes {
+    ack_with_window(port, seq, ack, 0xffff)
+}
+
+fn ack_with_window(port: u16, seq: u32, ack: u32, window: u16) -> Bytes {
     let (src, dst) = ([1u8, 1, 1, 1], [2u8, 2, 2, 2]);
     let mut buf = BytesMut::with_capacity(40);
     buf.put_slice(&[0x45, 0, 0, 40, 0, 1, 0x40, 0, 0x40, 6, 0, 0]);
@@ -52,7 +63,9 @@ fn ack(port: u16, seq: u32, ack: u32) -> Bytes {
     buf.put_u16(80);
     buf.put_u32(seq);
     buf.put_u32(ack);
-    buf.put_slice(&[0x50, 0x10, 0xff, 0xff, 0, 0, 0, 0]);
+    buf.put_slice(&[0x50, 0x10]);
+    buf.put_u16(window);
+    buf.put_slice(&[0, 0, 0, 0]);
     let sum = tcp_udp_checksum(src, dst, 6, &buf[20..]);
     buf[36..38].copy_from_slice(&sum.to_be_bytes());
     let sum = ipv4_checksum(&buf[..20]);
@@ -62,6 +75,7 @@ fn ack(port: u16, seq: u32, ack: u32) -> Bytes {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connections_memory() {
+    let _serial = serial();
     let (mut tun, tun_in, _) = MockTun::new();
     let (stack, mut listener, _udp) = NetStack::new();
     let (mut sink, mut stream) = stack.split();
@@ -153,4 +167,60 @@ async fn connections_memory() {
     // of the packets and the writers' chunks.
     assert!(downloaded < 200, "{downloaded} KiB");
     drop(idle);
+}
+
+/// Connections whose app stops reading (a video read ahead) hold what
+/// their buffers take on the way to it, and no more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connections_the_app_stops_reading() {
+    let _serial = serial();
+    let (mut tun, tun_in, _) = MockTun::new();
+    let (stack, mut listener, _udp) = NetStack::new();
+    let (mut sink, mut stream) = stack.split();
+    tokio::spawn(async move {
+        while let Some(pkt) = tun.next().await {
+            sink.send(Packet::new(pkt)).await.unwrap();
+        }
+    });
+    // The app completes each handshake with a closed window.
+    let client_in = tun_in.clone();
+    tokio::spawn(async move {
+        while let Some(Ok(pkt)) = stream.next().await {
+            let data = pkt.data();
+            if let Some(port) = tcp_dst_port(data)
+                && is_syn_ack(data)
+            {
+                let next = parse_server_isn(data).wrapping_add(1);
+                client_in.send(ack_with_window(port, 1, next, 0)).unwrap();
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let base = footprint();
+
+    for port in 30000..30000 + CONNECTIONS {
+        tun_in.send(build_tcp_syn_packet_with_port(port)).unwrap();
+    }
+    let mut writers = Vec::new();
+    for _ in 0..CONNECTIONS {
+        let mut s = listener.next().await.unwrap();
+        writers.push(tokio::spawn(async move {
+            let chunk = vec![0xab; 16 * 1024];
+            loop {
+                s.write_all(&chunk).await.unwrap();
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let held = (footprint() - base) / 1024 / CONNECTIONS as i64;
+    for w in writers {
+        w.abort();
+    }
+
+    let most = (TCP_SEND_BUFFERING / 1024) as i64;
+    eprintln!(
+        "per connection the app stopped reading: {held} KiB (buffers {most} KiB)"
+    );
+    // The buffers, and the writer's chunk.
+    assert!(held > most / 2 && held < most + 48, "{held} KiB");
 }

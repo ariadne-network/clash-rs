@@ -1,6 +1,8 @@
-//! A TCP socket's send buffer in pages of its own (our fork): mapped as
-//! they are first used, and given back when the connection closes and
-//! whenever the buffer is empty again after carrying data.
+//! A TCP connection's buffers in pages of their own (our fork): mapped as
+//! they are first used, and given back when the connection closes; the
+//! send buffer's also whenever it is empty again after carrying data.
+//! Buffers smaller than the allocator's lazily mapped large blocks were
+//! zeroed, all of them resident, as the connection opened.
 //!
 //! From the allocator, the pages a buffer had used stayed resident for as
 //! long as the connection was open, and after it closed until the
@@ -19,7 +21,8 @@ pub(crate) struct Pages {
     heap: Option<Box<[u8]>>,
 }
 
-// The buffer is used by the thread that owns its socket.
+// Owned by the socket's entry or its connection's ring, which says who
+// may use the buffer when.
 unsafe impl Send for Pages {}
 
 impl Pages {
@@ -47,6 +50,11 @@ impl Pages {
     /// used through it alone.
     pub(crate) unsafe fn buffer(&self) -> &'static mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    /// The start of the buffer, for copies in and out.
+    pub(crate) fn as_ptr(&self) -> *mut u8 {
+        self.ptr
     }
 
     /// Gives the pages back: the next use maps zeroed ones. Only while the

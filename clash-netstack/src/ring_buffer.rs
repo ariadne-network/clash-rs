@@ -1,10 +1,12 @@
-use std::{
-    cell::UnsafeCell,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::pages::Pages;
 
 pub struct LockFreeRingBuffer {
-    buffer: UnsafeCell<Box<[u8]>>,
+    /// In pages of its own (our fork), mapped as data first reaches them:
+    /// from the allocator, a ring smaller than its lazily mapped large
+    /// blocks was zeroed, all of it resident, as its connection opened.
+    pages: Pages,
     capacity: usize,
     /// The read position (high 32 bits, moved by the consumer) and the
     /// write position (low 32 bits, moved by the producer), together: the
@@ -34,7 +36,7 @@ impl LockFreeRingBuffer {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity <= u32::MAX as usize);
         Self {
-            buffer: UnsafeCell::new(vec![0u8; capacity].into_boxed_slice()),
+            pages: Pages::new(capacity),
             capacity,
             positions: AtomicU64::new(0),
         }
@@ -90,20 +92,29 @@ impl LockFreeRingBuffer {
             return 0;
         }
 
+        // SAFETY: the producer alone writes, to the free part, which the
+        // consumer does not read until the write position moves past it.
         unsafe {
-            let buffer = &mut *self.buffer.get();
+            let buffer = self.pages.as_ptr();
+            let src = data.as_ptr();
 
             // Handle wrap-around
             if write_pos + to_write <= self.capacity {
                 // No wrap
-                buffer[write_pos..write_pos + to_write]
-                    .copy_from_slice(&data[..to_write]);
+                std::ptr::copy_nonoverlapping(src, buffer.add(write_pos), to_write);
             } else {
                 // Wrap around
                 let first_part = self.capacity - write_pos;
-                buffer[write_pos..].copy_from_slice(&data[..first_part]);
-                buffer[..to_write - first_part]
-                    .copy_from_slice(&data[first_part..to_write]);
+                std::ptr::copy_nonoverlapping(
+                    src,
+                    buffer.add(write_pos),
+                    first_part,
+                );
+                std::ptr::copy_nonoverlapping(
+                    src.add(first_part),
+                    buffer,
+                    to_write - first_part,
+                );
             }
         }
 
@@ -131,20 +142,25 @@ impl LockFreeRingBuffer {
             return 0;
         }
 
+        // SAFETY: the consumer alone reads, from the filled part, which the
+        // producer does not write until the read position moves past it.
         unsafe {
-            let buffer = &*self.buffer.get();
+            let buffer = self.pages.as_ptr();
+            let dst = buf.as_mut_ptr();
 
             // Handle wrap-around
             if read_pos + to_read <= self.capacity {
                 // No wrap
-                buf[..to_read]
-                    .copy_from_slice(&buffer[read_pos..read_pos + to_read]);
+                std::ptr::copy_nonoverlapping(buffer.add(read_pos), dst, to_read);
             } else {
                 // Wrap around
                 let first_part = self.capacity - read_pos;
-                buf[..first_part].copy_from_slice(&buffer[read_pos..]);
-                buf[first_part..to_read]
-                    .copy_from_slice(&buffer[..to_read - first_part]);
+                std::ptr::copy_nonoverlapping(buffer.add(read_pos), dst, first_part);
+                std::ptr::copy_nonoverlapping(
+                    buffer,
+                    dst.add(first_part),
+                    to_read - first_part,
+                );
             }
         }
 

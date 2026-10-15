@@ -21,27 +21,42 @@ use std::{
 use tokio::sync::mpsc;
 
 // Each connection has a smoltcp buffer and a ring buffer per direction,
-// their pages taken as data passes. On iOS (our fork) half the size: a
-// packet tunnel may use about 50 MiB, and an image feed keeps dozens of
-// connections busy. 128 KiB still comes from the allocator's lazily mapped
-// large blocks, so idle connections cost little.
+// each in pages of its own taken as data passes (pages.rs). On iOS (our
+// fork) smaller: a packet tunnel may use about 50 MiB, and apps keep many
+// connections busy at once (an image feed) or full while they stop reading
+// (a video read ahead), each holding its buffers' worth. A smoltcp buffer
+// bounds the data in flight to the app, so a connection's speed is at most
+// its size over the app's round trip: 64 KiB is about 60 MiB/s at 1 ms.
+// The rings only hand data over between the relay and smoltcp; their size
+// does not change the speed.
 #[cfg(not(target_os = "ios"))]
 const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 256 * 1024; // 256 KiB
 #[cfg(not(target_os = "ios"))]
 const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 256 * 1024; // 256 KiB
+#[cfg(not(target_os = "ios"))]
+const TCP_RING_SIZE: usize = 256 * 1024;
 #[cfg(target_os = "ios")]
-const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 128 * 1024;
+const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 64 * 1024;
 #[cfg(target_os = "ios")]
-const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 128 * 1024;
+const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 64 * 1024;
+#[cfg(target_os = "ios")]
+const TCP_RING_SIZE: usize = 32 * 1024;
+
+/// The most a connection holds of data on its way to the app (our fork):
+/// its ring and its smoltcp send buffer full, as when the app stops
+/// reading.
+pub const TCP_SEND_BUFFERING: usize =
+    DEFAULT_TCP_SEND_BUFFER_SIZE as usize + TCP_RING_SIZE;
 
 /// A send buffer that carried this much since its pages were given back
 /// gives them back again once all of it is acknowledged (our fork).
 const RELEASE_SEND_PAGES_AFTER: usize = 64 * 1024;
 
-/// A socket's send buffer, and what passed through it since its pages
-/// were last given back.
-pub(crate) struct SendPages {
-    pages: Pages,
+/// A socket's buffers, and what passed through the send buffer since its
+/// pages were last given back.
+pub(crate) struct SocketPages {
+    send: Pages,
+    recv: Pages,
     passed: usize,
 }
 
@@ -84,13 +99,9 @@ pub(crate) struct TcpStreamHandle {
 impl TcpStreamHandle {
     pub fn new() -> Self {
         Self {
-            recv_buffer: LockFreeRingBuffer::new(
-                DEFAULT_TCP_RECV_BUFFER_SIZE as usize,
-            ),
+            recv_buffer: LockFreeRingBuffer::new(TCP_RING_SIZE),
             recv_waker: AtomicWaker::new(),
-            send_buffer: LockFreeRingBuffer::new(
-                DEFAULT_TCP_SEND_BUFFER_SIZE as usize,
-            ),
+            send_buffer: LockFreeRingBuffer::new(TCP_RING_SIZE),
             send_waker: AtomicWaker::new(),
             socket_dropped: AtomicBool::new(false),
             socket_closed: AtomicBool::new(false),
@@ -278,24 +289,22 @@ impl TcpListener {
                         continue;
                     }
 
-                    // The send buffer in pages of its own (pages.rs); the
-                    // receive buffer stays in the allocator: smoltcp keeps
-                    // segments that came out of order past what it holds,
-                    // so it is never known to be unused.
-                    let send_pages = SendPages {
-                        pages: Pages::new(DEFAULT_TCP_SEND_BUFFER_SIZE as usize),
+                    // The buffers in pages of their own (pages.rs). Only
+                    // the send buffer's go back while the connection is
+                    // open: smoltcp keeps segments that came out of order
+                    // past what the receive buffer holds, so it is never
+                    // known to be unused.
+                    let pages = SocketPages {
+                        send: Pages::new(DEFAULT_TCP_SEND_BUFFER_SIZE as usize),
+                        recv: Pages::new(DEFAULT_TCP_RECV_BUFFER_SIZE as usize),
                         passed: 0,
                     };
+                    // SAFETY: the socket goes before its pages: they come
+                    // after it in the event and in `socket_maps`, and the
+                    // socket set is dropped first.
                     let mut socket = tcp::Socket::new(
-                        tcp::SocketBuffer::new(vec![
-                            0u8;
-                            DEFAULT_TCP_RECV_BUFFER_SIZE
-                                as usize
-                        ]),
-                        // SAFETY: the socket goes before its pages: they
-                        // come after it in the event and in `socket_maps`,
-                        // and the socket set is dropped first.
-                        tcp::SocketBuffer::new(unsafe { send_pages.pages.buffer() }),
+                        tcp::SocketBuffer::new(unsafe { pages.recv.buffer() }),
+                        tcp::SocketBuffer::new(unsafe { pages.send.buffer() }),
                     );
                     socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(
                         28,
@@ -336,7 +345,7 @@ impl TcpListener {
                         })?;
                     iface_notifier
                         .send(IfaceEvent::TcpStream(Box::new((
-                            socket, handle, send_pages,
+                            socket, handle, pages,
                         ))))
                         .map_err(|e| {
                             error!("Failed to send TCP stream event: {e}");
@@ -374,7 +383,7 @@ impl TcpListener {
         // its send buffers.
         let mut socket_maps: HashMap<
             smoltcp::iface::SocketHandle,
-            (Arc<TcpStreamHandle>, SendPages),
+            (Arc<TcpStreamHandle>, SocketPages),
         > = HashMap::new();
         // Create a socket set for TCP sockets
         let mut sockets = smoltcp::iface::SocketSet::new(vec![]);
@@ -440,7 +449,7 @@ impl TcpListener {
                 iface.poll(now, device, &mut sockets);
 
                 // Poll the sockets for new connections or data
-                for (socket_handle, (socket_control, send_pages)) in
+                for (socket_handle, (socket_control, pages)) in
                     socket_maps.iter_mut()
                 {
                     let socket = sockets.get_mut::<tcp::Socket>(*socket_handle);
@@ -474,17 +483,17 @@ impl TcpListener {
                             (n, n)
                         }) {
                             trace!("Sent {n} bytes to TCP socket");
-                            send_pages.passed += n;
+                            pages.passed += n;
                         }
                         notify_write = true;
                     }
                     // All of it sent and acknowledged: the pages a download
                     // used go back.
-                    if send_pages.passed >= RELEASE_SEND_PAGES_AFTER
+                    if pages.passed >= RELEASE_SEND_PAGES_AFTER
                         && socket.send_queue() == 0
                     {
-                        send_pages.pages.release();
-                        send_pages.passed = 0;
+                        pages.send.release();
+                        pages.passed = 0;
                     }
 
                     if notify_write {
