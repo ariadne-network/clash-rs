@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 
 use hickory_net::{
-    DnsHandle, client, h2::HttpsClientStream, tcp::TcpClientStream,
+    DnsHandle, NetError, client, h2::HttpsClientStream, tcp::TcpClientStream,
     tls::tls_client_connect, udp::UdpClientStream, xfer::FirstAnswer,
 };
 use hickory_proto::{
@@ -22,7 +22,7 @@ use hickory_proto::{
 };
 use rustls::{ClientConfig, pki_types::ServerName};
 use tokio::{sync::RwLock, task::JoinHandle};
-use tracing::{info, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{
     Error,
@@ -72,6 +72,7 @@ mod tests {
             inner: Arc::new(RwLock::new(Inner {
                 c: None,
                 bg_handle: None,
+                generation: 0,
             })),
             cfg: DnsConfig::Udp(addr, None, proxy.clone(), None),
             proxy,
@@ -82,6 +83,71 @@ mod tests {
             ecs,
             rule_dispatch: None,
         }
+    }
+
+    /// A DNS server over TCP on localhost that closes its first connection
+    /// on the first query, unanswered, and answers on the others.
+    async fn server_dropping_the_first_query() -> net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut first = true;
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let drop_it = std::mem::take(&mut first);
+                tokio::spawn(async move {
+                    loop {
+                        let Ok(len) = tcp.read_u16().await else {
+                            return;
+                        };
+                        let mut query = vec![0; len as usize];
+                        if tcp.read_exact(&mut query).await.is_err() || drop_it {
+                            return;
+                        }
+                        let query = Message::from_vec(&query).unwrap();
+                        let mut answer = Message::new(
+                            query.metadata.id,
+                            op::MessageType::Response,
+                            op::OpCode::Query,
+                        );
+                        answer.add_queries(query.queries.clone());
+                        let answer = answer.to_vec().unwrap();
+                        tcp.write_u16(answer.len() as u16).await.unwrap();
+                        tcp.write_all(&answer).await.unwrap();
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_query_whose_connection_closes_goes_again() {
+        let addr = server_dropping_the_first_query().await;
+        let proxy = Arc::new(proxy::direct::Handler::new("test-proxy"));
+        let client = DnsClient {
+            inner: Arc::new(RwLock::new(Inner {
+                c: None,
+                bg_handle: None,
+                generation: 0,
+            })),
+            cfg: DnsConfig::Tcp(addr, None, proxy.clone(), None),
+            proxy,
+            host: url::Host::Ipv4(net::Ipv4Addr::LOCALHOST),
+            port: addr.port(),
+            net: DNSNetMode::Tcp,
+            iface: None,
+            ecs: None,
+            rule_dispatch: None,
+        };
+        let answer = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.exchange(&build_message(RecordType::A)),
+        )
+        .await
+        .expect("no answer");
+        assert!(answer.is_ok(), "{answer:?}");
+        assert_eq!(client.inner.read().await.generation, 2);
     }
 
     fn build_message(record_type: RecordType) -> Message {
@@ -279,6 +345,9 @@ impl Display for DnsConfig {
 struct Inner {
     c: Option<client::Client<DnsRuntimeProvider>>,
     bg_handle: Option<JoinHandle<()>>,
+    /// Counts the connections made (our fork): a query that lost its
+    /// connection makes a new one unless another query already did.
+    generation: u64,
 }
 
 /// DnsClient
@@ -409,6 +478,7 @@ impl DnsClient {
                     inner: Arc::new(RwLock::new(Inner {
                         c: None,
                         bg_handle: None,
+                        generation: 0,
                     })),
                     cfg,
                     proxy: opts.proxy,
@@ -431,6 +501,7 @@ impl DnsClient {
                     inner: Arc::new(RwLock::new(Inner {
                         c: None,
                         bg_handle: None,
+                        generation: 0,
                     })),
 
                     cfg,
@@ -455,6 +526,7 @@ impl DnsClient {
                     inner: Arc::new(RwLock::new(Inner {
                         c: None,
                         bg_handle: None,
+                        generation: 0,
                     })),
                     cfg,
                     proxy: opts.proxy,
@@ -479,6 +551,7 @@ impl DnsClient {
                     inner: Arc::new(RwLock::new(Inner {
                         c: None,
                         bg_handle: None,
+                        generation: 0,
                     })),
 
                     cfg,
@@ -587,6 +660,7 @@ impl Client for DnsClient {
                         let (client, bg) = self.rebuild_with_retries().await?;
                         inner.c.replace(client);
                         inner.bg_handle.replace(bg);
+                        inner.generation += 1;
                     } else {
                         trace!(
                             "dns client background task is still running, reusing \
@@ -600,6 +674,7 @@ impl Client for DnsClient {
                     let (client, bg) = self.rebuild_with_retries().await?;
                     inner.c.replace(client);
                     inner.bg_handle.replace(bg);
+                    inner.generation += 1;
                 }
             }
         }
@@ -611,17 +686,75 @@ impl Client for DnsClient {
         if req.metadata.id == 0 {
             req.metadata.id = rand::random::<u16>();
         }
-        self.inner
-            .read()
-            .await
-            .c
-            .as_ref()
-            .unwrap()
-            .send(req)
-            .first_answer()
-            .await
+        // A server may close its connection as a query goes out (DoH
+        // servers close idle ones): the query was lost with it and failed,
+        // though only the next query made a new connection. It goes once
+        // more, on a new connection (our fork).
+        let (generation, result) = self.send(req.clone()).await;
+        let result = match result {
+            Err(e) if self.connection_went_away(&e).await => {
+                debug!(
+                    "{}: connection closed under a query ({e}), retrying",
+                    self.id()
+                );
+                self.reconnect(generation).await?;
+                self.send(req).await.1
+            }
+            result => result,
+        };
+        result
             .map_err(|x| Error::DNSError(x.to_string()).into())
             .map(|x: op::DnsResponse| x.into_message())
+    }
+}
+
+impl DnsClient {
+    /// One try on the current connection, and which connection it was.
+    async fn send(
+        &self,
+        req: DnsRequest,
+    ) -> (u64, Result<op::DnsResponse, NetError>) {
+        let (client, generation) = {
+            let inner = self.inner.read().await;
+            (inner.c.clone(), inner.generation)
+        };
+        let Some(client) = client else {
+            return (generation, Err(NetError::Busy));
+        };
+        (generation, client.send(req).first_answer().await)
+    }
+
+    /// Whether a query failed because its connection ended under it.
+    async fn connection_went_away(&self, e: &NetError) -> bool {
+        match e {
+            // The connection ended with the query unanswered.
+            NetError::Message("receiver was canceled") => true,
+            // Nothing takes queries any more, or too many wait.
+            NetError::Busy => self
+                .inner
+                .read()
+                .await
+                .bg_handle
+                .as_ref()
+                .is_none_or(|bg| bg.is_finished()),
+            e => e.is_connection_closed(),
+        }
+    }
+
+    /// A new connection in place of `generation`, unless there is one.
+    async fn reconnect(&self, generation: u64) -> anyhow::Result<()> {
+        let mut inner = self.inner.write().await;
+        if inner.generation != generation {
+            return Ok(());
+        }
+        if let Some(bg) = inner.bg_handle.take() {
+            bg.abort();
+        }
+        let (client, bg) = self.rebuild_with_retries().await?;
+        inner.c.replace(client);
+        inner.bg_handle.replace(bg);
+        inner.generation += 1;
+        Ok(())
     }
 }
 
